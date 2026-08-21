@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""Talk to the hbu RAG database without knowing where it is.
+
+Terraform publishes the connection details to SSM under ``/<project>-<env>/db/*``
+and lets RDS keep the master password in Secrets Manager. This resolves both,
+so nothing here — and nothing in the app — carries an endpoint that changes
+every time the instance is replaced, or a password that has to be pasted.
+
+    ./scripts/db.py url                  # connection URL, password included
+    ./scripts/db.py env [--app]          # shell exports; --app for the pipeline role
+    ./scripts/db.py ca                   # RDS root cert, for sslmode=verify-full
+    ./scripts/db.py bootstrap            # the dataplatform's role + grants file
+    ./scripts/db.py init                 # apply sql/*.sql in name order
+    ./scripts/db.py check                # extensions, tables, corpus, index metadata
+    ./scripts/db.py shell                # psql, or a REPL if psql is absent
+    ./scripts/db.py query "select 1"     # one statement, printed as a table
+    ./scripts/db.py wait                 # block until the instance accepts TCP
+    ./scripts/db.py start | stop         # for a scheduled-shutdown instance
+
+Every command takes ``--env`` (default ``dev``) and honours ``AWS_PROFILE``.
+Set ``DATABASE_URL`` to bypass AWS resolution entirely — a local
+postgis+pgvector container, or an already-open SSM tunnel. Append
+``?sslmode=disable`` for a server that speaks no TLS.
+
+Two databases' worth of ownership meet here, and the split matters:
+``rag.chunks`` belongs to hbu_dataplatform, which creates it on first load;
+this repo's sql/ owns the extensions, the spatial tables, and the functions
+that join the two. See the README.
+
+Importable too, which is the point of the ``connect`` helper:
+
+    from db import connect
+    with connect(env="dev") as conn: ...
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import quote
+
+SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
+
+DEFAULT_PROJECT = os.environ.get("HBU_PROJECT", "hbu")
+DEFAULT_ENV = os.environ.get("HBU_ENV", "dev")
+DEFAULT_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+
+#: Where `db.py ca` puts the RDS root certificate, and where libpq looks by
+#: default — so verify-full works with no PGSSLROOTCERT set at all.
+CA_BUNDLE = Path.home() / ".postgresql" / "root.crt"
+
+# Cosmetic only, and skipped when stdout is not a terminal so piped output
+# stays greppable.
+_TTY = sys.stdout.isatty()
+DIM = "\033[2m" if _TTY else ""
+BOLD = "\033[1m" if _TTY else ""
+RED = "\033[31m" if _TTY else ""
+GREEN = "\033[32m" if _TTY else ""
+RESET = "\033[0m" if _TTY else ""
+
+
+class DbError(RuntimeError):
+    """Anything the caller should read rather than see a traceback for."""
+
+
+# ---------------------------------------------------------------------------
+# Resolving the connection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Connection:
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
+    instance_id: str | None = None
+    #: require is right for RDS, which rejects cleartext anyway. A local
+    #: postgres+postgis container speaks no TLS at all and needs `disable`,
+    #: which is why this is read from DATABASE_URL rather than fixed.
+    sslmode: str = "require"
+
+    def url(self, *, hide_password: bool = False) -> str:
+        secret = "***" if hide_password else quote(self.password, safe="")
+        return (
+            f"postgresql://{quote(self.user, safe='')}:{secret}"
+            f"@{self.host}:{self.port}/{self.dbname}?sslmode={self.sslmode}"
+        )
+
+    def kwargs(self) -> dict:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "dbname": self.dbname,
+            "user": self.user,
+            "password": self.password,
+            "sslmode": self.sslmode,
+        }
+
+
+@lru_cache(maxsize=None)
+def _aws(service: str, region: str):
+    try:
+        import boto3
+    except ImportError as exc:  # pragma: no cover - environment problem
+        raise DbError("boto3 is not installed — `pip install -r scripts/requirements.txt`") from exc
+    return boto3.client(service, region_name=region)
+
+
+def _from_ssm(project: str, env: str, region: str) -> Connection:
+    prefix = f"/{project}-{env}"
+    ssm = _aws("ssm", region)
+
+    values: dict[str, str] = {}
+    paginator = ssm.get_paginator("get_parameters_by_path")
+    try:
+        for page in paginator.paginate(Path=prefix, Recursive=True, WithDecryption=True):
+            for param in page["Parameters"]:
+                values[param["Name"][len(prefix) + 1 :]] = param["Value"]
+    except ssm.exceptions.ClientError as exc:
+        raise DbError(f"could not read SSM parameters under {prefix}: {exc}") from exc
+
+    if "db/host" not in values:
+        raise DbError(
+            f"no database parameters under {prefix} in {region}.\n"
+            f"  Has `make apply ENV={env}` run? Is AWS_PROFILE pointing at the right account?"
+        )
+
+    secret_arn = values["db/secret_arn"]
+    secrets = _aws("secretsmanager", region)
+    try:
+        payload = json.loads(secrets.get_secret_value(SecretId=secret_arn)["SecretString"])
+    except Exception as exc:
+        raise DbError(
+            f"could not read the master password from {secret_arn}: {exc}\n"
+            "  The RDS-managed secret needs secretsmanager:GetSecretValue."
+        ) from exc
+
+    return Connection(
+        host=values["db/host"],
+        port=int(values["db/port"]),
+        dbname=values["db/name"],
+        user=values["db/user"],
+        password=payload["password"],
+        instance_id=values.get("db/instance_id"),
+    )
+
+
+def _from_url(url: str) -> Connection:
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise DbError(f"DATABASE_URL must be a postgresql:// URL, got {parsed.scheme!r}")
+    query = parse_qs(parsed.query)
+    return Connection(
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 5432,
+        dbname=(parsed.path or "/postgres").lstrip("/"),
+        user=unquote(parsed.username or "postgres"),
+        password=unquote(parsed.password or ""),
+        sslmode=query.get("sslmode", ["require"])[0],
+    )
+
+
+def resolve(
+    env: str = DEFAULT_ENV,
+    *,
+    project: str = DEFAULT_PROJECT,
+    region: str = DEFAULT_REGION,
+) -> Connection:
+    """Connection details, from DATABASE_URL if set and from AWS otherwise."""
+    override = os.environ.get("DATABASE_URL")
+    if override:
+        return _from_url(override)
+    return _from_ssm(project, env, region)
+
+
+# ---------------------------------------------------------------------------
+# Connecting
+# ---------------------------------------------------------------------------
+
+
+def _driver():
+    """psycopg 3 if present, psycopg2 otherwise, with one clear error if not."""
+    try:
+        import psycopg
+
+        return psycopg, 3
+    except ImportError:
+        pass
+    try:
+        import psycopg2
+
+        return psycopg2, 2
+    except ImportError:
+        pass
+    raise DbError(
+        "no postgres driver installed — `pip install -r scripts/requirements.txt`\n"
+        "  (psycopg[binary] bundles libpq, so there is no system psql to install)"
+    )
+
+
+def connect(env: str = DEFAULT_ENV, **kwargs):
+    """Open a connection. The returned object is a context manager."""
+    details = kwargs.pop("connection", None) or resolve(env, **kwargs)
+    driver, version = _driver()
+    if version == 3:
+        return driver.connect(**details.kwargs(), autocommit=True)
+    conn = driver.connect(**details.kwargs())
+    conn.autocommit = True
+    return conn
+
+
+def _run(conn, sql: str, params=None) -> tuple[list[str], list[tuple]]:
+    with conn.cursor() as cur:
+        # Passing no parameters at all, rather than an explicit None, is what
+        # keeps psycopg on the simple query protocol — which is the only one
+        # that accepts a whole .sql file's worth of statements in one call.
+        if params is None:
+            cur.execute(sql)
+        else:
+            cur.execute(sql, params)
+        if cur.description is None:
+            return [], []
+        return [d[0] for d in cur.description], list(cur.fetchall())
+
+
+def _table(columns: list[str], rows: list[tuple], *, max_width: int = 60) -> str:
+    if not columns:
+        return f"{DIM}(no rows returned){RESET}"
+
+    def cell(value) -> str:
+        text = "" if value is None else str(value)
+        text = " ".join(text.split())
+        return text if len(text) <= max_width else text[: max_width - 1] + "…"
+
+    body = [[cell(v) for v in row] for row in rows]
+    widths = [
+        max(len(col), *(len(r[i]) for r in body)) if body else len(col)
+        for i, col in enumerate(columns)
+    ]
+    line = "-+-".join("-" * w for w in widths)
+    out = [
+        BOLD + " | ".join(c.ljust(w) for c, w in zip(columns, widths)) + RESET,
+        DIM + line + RESET,
+    ]
+    out += [" | ".join(c.ljust(w) for c, w in zip(row, widths)) for row in body]
+    out.append(f"{DIM}({len(body)} row{'s' if len(body) != 1 else ''}){RESET}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_url(args) -> int:
+    print(resolve(args.env, region=args.region).url(hide_password=args.hide_password))
+    return 0
+
+
+def cmd_env(args) -> int:
+    """Shell exports: `eval "$(./scripts/db.py env)"`.
+
+    Both dialects, because two things read this. PG* is what psql and libpq
+    pick up; URBAN_RAG_PG_* is what the dataplatform's PgSettings.from_env
+    reads, so the same eval configures a `urban-rag` run against this instance.
+
+    These are the MASTER credentials. For the pipeline's own role, use
+    `--app`, which points URBAN_RAG_PG_SECRET_ID at the app secret and lets
+    PgSettings resolve the password itself rather than putting it in a shell.
+    """
+    details = resolve(args.env, region=args.region)
+
+    if args.app:
+        prefix = f"/{DEFAULT_PROJECT}-{args.env}"
+        try:
+            secret_id = _aws("ssm", args.region).get_parameter(
+                Name=f"{prefix}/db/app_secret_arn"
+            )["Parameter"]["Value"]
+        except Exception as exc:
+            raise DbError(f"no {prefix}/db/app_secret_arn — apply the Terraform first") from exc
+        print(f"export URBAN_RAG_PG_HOST={details.host}")
+        print(f"export URBAN_RAG_PG_PORT={details.port}")
+        print(f"export URBAN_RAG_PG_DATABASE={details.dbname}")
+        print(f"export URBAN_RAG_PG_SECRET_ID={secret_id}")
+        print(f"export URBAN_RAG_PG_REGION={args.region}")
+        print("export URBAN_RAG_PG_SSLMODE=verify-full")
+        print(f"export PGSSLROOTCERT={CA_BUNDLE}")
+        return 0
+
+    print(f"export PGHOST={details.host}")
+    print(f"export PGPORT={details.port}")
+    print(f"export PGDATABASE={details.dbname}")
+    print(f"export PGUSER={details.user}")
+    print(f"export PGPASSWORD={details.password}")
+    print("export PGSSLMODE=require")
+    print(f"export DATABASE_URL='{details.url()}'")
+    print(f"export URBAN_RAG_PG_HOST={details.host}")
+    print(f"export URBAN_RAG_PG_PORT={details.port}")
+    print(f"export URBAN_RAG_PG_DATABASE={details.dbname}")
+    print(f"export URBAN_RAG_PG_USER={details.user}")
+    print(f"export URBAN_RAG_PG_PASSWORD={details.password}")
+    print(f"export URBAN_RAG_PG_REGION={args.region}")
+    return 0
+
+
+def cmd_ca(args) -> int:
+    """Download the RDS CA bundle that sslmode=verify-full needs.
+
+    verify-full is the only mode that authenticates the server rather than just
+    encrypting the link, and it is the dataplatform's default — but it needs a
+    root certificate on disk to check the endpoint against.
+    """
+    import urllib.request
+
+    target = Path(args.output).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    url = "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
+    print(f"{url}\n  -> {target}")
+    urllib.request.urlretrieve(url, target)
+    print(f"  {GREEN}ok{RESET} ({target.stat().st_size // 1024} KB)")
+    print(f"  {DIM}export PGSSLROOTCERT={target}{RESET}")
+    return 0
+
+
+def _requires(sql: str) -> str | None:
+    """The relation a file names in a leading `-- requires: <name>` comment."""
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("--"):
+            break
+        match = re.match(r"--\s*requires:\s*(\S+)", stripped)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _requires(sql: str) -> str | None:
+    """The relation a file names in a leading `-- requires: <name>` comment."""
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("--"):
+            break
+        match = re.match(r"--\s*requires:\s*(\S+)", stripped)
+        if match:
+            return match.group(1)
+    return None
+
+
+def cmd_init(args) -> int:
+    details = resolve(args.env, region=args.region)
+    files = sorted(SQL_DIR.glob("*.sql"))
+    if not files:
+        raise DbError(f"no .sql files in {SQL_DIR}")
+
+    applied = skipped = 0
+    with connect(connection=details) as conn:
+        # HNSW builds are memory-bound; RDS defaults this to 64MB on a
+        # db.t4g.micro. Doubling it for this session only is the safe move —
+        # shared_buffers already claims ~25% of the instance's 1 GiB, and an
+        # index that does not fit spills to disk (slow) rather than failing.
+        _run(conn, "SET maintenance_work_mem = '128MB'")
+
+        for path in files:
+            sql = path.read_text(encoding="utf-8")
+
+            # A file may declare a relation it cannot be parsed without —
+            # rag.chunks belongs to the dataplatform and does not exist until
+            # its first load. Skipping it is information, not an error.
+            required = _requires(sql)
+            if required:
+                _, rows = _run(conn, "SELECT to_regclass(%s)", (required,))
+                if not rows or rows[0][0] is None:
+                    print(f"{BOLD}{path.name}{RESET} {DIM}skipped — {required} does not exist yet{RESET}")
+                    skipped += 1
+                    continue
+
+            print(f"{BOLD}{path.name}{RESET}")
+            try:
+                _run(conn, sql)
+            except Exception as exc:
+                raise DbError(f"{path.name} failed: {exc}") from exc
+            print(f"  {GREEN}ok{RESET}")
+            applied += 1
+
+    print(f"\n{GREEN}{applied} file(s) applied{RESET}" + (f", {skipped} skipped" if skipped else ""))
+    if skipped:
+        print(f"{DIM}Re-run once the dataplatform's document_index asset has created rag.chunks.{RESET}")
+    return 0
+
+
+# psql meta-commands this has to understand to run a file written for psql.
+_PSQL_SET = re.compile(r"^\\set\s+(\S+)(?:\s+(.*))?$")
+
+
+def cmd_bootstrap(args) -> int:
+    """Run the dataplatform's pgvector_bootstrap.sql as the master user.
+
+    That file creates the `urban_rag` login role, the `rag` schema it owns, and
+    the grants — the things the pipeline's own role is deliberately not
+    privileged enough to create for itself. It lives in the dataplatform
+    because that is the repo whose code connects as that role; it runs from
+    here because this is where the master credentials are.
+
+    It is written for psql, so the few backslash meta-commands it uses are
+    interpreted here instead of requiring psql to be installed.
+    """
+    import secrets as secrets_module
+
+    path = Path(args.file)
+    if not path.exists():
+        raise DbError(
+            f"{path} not found — pass --file with the path to the dataplatform's "
+            "sql/pgvector_bootstrap.sql"
+        )
+
+    details = resolve(args.env, region=args.region)
+    password = args.app_password or secrets_module.token_urlsafe(24)
+
+    variables: dict[str, str] = {}
+    body: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("\\"):
+            match = _PSQL_SET.match(stripped)
+            # `\set name value` defines a substitution; `\set ON_ERROR_STOP on`
+            # and every other meta-command is a psql-ism with no SQL meaning.
+            if match and match.group(2) and match.group(1).islower():
+                variables[match.group(1)] = match.group(2).strip()
+            continue
+        body.append(line)
+
+    # Quoted: it is substituted into ALTER ROLE ... WITH PASSWORD, where psql
+    # would have passed it as a literal too.
+    variables["app_password"] = "'" + password.replace("'", "''") + "'"
+
+    rendered = "\n".join(body)
+    # Longest name first, so :app_user is not clipped by a shorter :app.
+    for name in sorted(variables, key=len, reverse=True):
+        rendered = rendered.replace(":" + name, variables[name])
+
+    # Anything still looking like :name would reach Postgres as a syntax error
+    # twenty statements in; catching it here says which variable was missing.
+    uncommented = re.sub(r"(?m)--.*$", "", rendered).replace("::", " ")
+    leftovers = sorted(set(re.findall(r"(?<![:\w]):([a-z_]{2,})", uncommented)))
+    if leftovers:
+        raise DbError(f"unsubstituted psql variables in {path.name}: {', '.join(leftovers)}")
+
+    with connect(connection=details) as conn:
+        print(f"applying {path.name} as {details.user}")
+        try:
+            _run(conn, rendered)
+        except Exception as exc:
+            raise DbError(f"{path.name} failed: {exc}") from exc
+    print(f"  {GREEN}ok{RESET}")
+
+    if args.store_password:
+        _store_app_password(args, details, password)
+        print(f"  {GREEN}stored{RESET} in the app-role secret — the pipeline reads it from there")
+    else:
+        print(f"\n  app role password: {BOLD}{password}{RESET}")
+        print(f"  {DIM}re-run with --store-password to put it in Secrets Manager instead{RESET}")
+    return 0
+
+
+def _store_app_password(args, details: "Connection", password: str) -> None:
+    """Write the generated password into the secret Terraform created for it."""
+    prefix = f"/{DEFAULT_PROJECT}-{args.env}"
+    ssm = _aws("ssm", args.region)
+    try:
+        secret_id = ssm.get_parameter(Name=f"{prefix}/db/app_secret_arn")["Parameter"]["Value"]
+    except Exception as exc:
+        raise DbError(f"no {prefix}/db/app_secret_arn parameter — apply the Terraform first") from exc
+
+    # The shape PgSettings.secret_id expects, which is also the shape RDS
+    # writes for a password it manages itself.
+    _aws("secretsmanager", args.region).put_secret_value(
+        SecretId=secret_id,
+        SecretString=json.dumps(
+            {
+                "username": args.app_user,
+                "password": password,
+                "engine": "postgres",
+                "host": details.host,
+                "port": details.port,
+                "dbname": details.dbname,
+            }
+        ),
+    )
+
+
+def cmd_check(args) -> int:
+    details = resolve(args.env, region=args.region)
+    with connect(connection=details) as conn:
+        print(f"{BOLD}server{RESET}")
+        cols, rows = _run(conn, "SELECT version()")
+        print("  " + rows[0][0].split(" on ")[0])
+        print("  " + f"{details.user}@{details.host}:{details.port}/{details.dbname}")
+
+        print(f"\n{BOLD}extensions{RESET}")
+        cols, rows = _run(
+            conn,
+            """
+            SELECT e.name AS extension,
+                   COALESCE(x.extversion, '-') AS installed,
+                   e.default_version AS available
+              FROM pg_available_extensions e
+              LEFT JOIN pg_extension x ON x.extname = e.name
+             WHERE e.name IN ('postgis', 'vector', 'pg_trgm', 'pg_stat_statements')
+             ORDER BY e.name
+            """,
+        )
+        print(_table(cols, rows))
+        missing = [r[0] for r in rows if r[1] == "-"]
+        if missing:
+            print(f"  {RED}not installed: {', '.join(missing)}{RESET} — run `db.py init`")
+
+        print(f"\n{BOLD}rag schema{RESET}")
+        cols, rows = _run(
+            conn,
+            """
+            SELECT c.relname AS object,
+                   CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ELSE c.relkind::text END AS kind,
+                   COALESCE(s.n_live_tup, 0) AS rows,
+                   pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+             WHERE n.nspname = 'rag' AND c.relkind IN ('r', 'v')
+             ORDER BY c.relkind, c.relname
+            """,
+        )
+        print(_table(cols, rows) if rows else f"  {DIM}empty — run `db.py init`{RESET}")
+
+        # rag.chunks and rag.corpus_status are created by the dataplatform's
+        # first load, not by this repo, so their absence is a stage of setup
+        # rather than a fault.
+        _, exists = _run(conn, "SELECT to_regclass('rag.corpus_status')")
+        if exists and exists[0][0] is not None:
+            print(f"\n{BOLD}corpus{RESET}")
+            cols, rows = _run(conn, "SELECT * FROM rag.corpus_status")
+            print(_table(cols, rows))
+
+            # The vector width and the model that produced it live here,
+            # written by the dataplatform on load. This is the only place they
+            # are recorded, on purpose: a second copy in SSM or in a config
+            # file is a second thing that can disagree with the vectors.
+            _, meta = _run(conn, "SELECT to_regclass('rag.chunks_meta')")
+            if meta and meta[0][0] is not None:
+                cols, rows = _run(conn, "SELECT key, value FROM rag.chunks_meta ORDER BY key")
+                print(f"\n{BOLD}index metadata{RESET}")
+                print(_table(cols, rows))
+        else:
+            print(
+                f"\n{DIM}rag.chunks not created yet — the dataplatform's document_index"
+                f" asset creates it on first load, then `db-init` adds the spatial"
+                f" search functions over it.{RESET}"
+            )
+    return 0
+
+
+def cmd_query(args) -> int:
+    sql = Path(args.file).read_text(encoding="utf-8") if args.file else args.sql
+    if not sql:
+        raise DbError("give a statement, or -f FILE")
+    with connect(env=args.env, region=args.region) as conn:
+        cols, rows = _run(conn, sql)
+    if args.json:
+        print(json.dumps([dict(zip(cols, r)) for r in rows], default=str, indent=2))
+    else:
+        print(_table(cols, rows))
+    return 0
+
+
+def cmd_shell(args) -> int:
+    details = resolve(args.env, region=args.region)
+    psql = shutil.which("psql")
+    if psql:
+        env = {**os.environ, "PGPASSWORD": details.password}
+        return subprocess.call(
+            [
+                psql,
+                f"--host={details.host}",
+                f"--port={details.port}",
+                f"--dbname={details.dbname}",
+                f"--username={details.user}",
+                "--set=sslmode=require",
+            ],
+            env=env,
+        )
+
+    print(f"{DIM}psql not found — using the built-in REPL. ';' ends a statement, Ctrl-D exits.{RESET}")
+    with connect(connection=details) as conn:
+        buffer: list[str] = []
+        while True:
+            try:
+                line = input("... " if buffer else f"{details.dbname}=# ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            buffer.append(line)
+            if not line.rstrip().endswith(";"):
+                continue
+            statement = "\n".join(buffer).rstrip().rstrip(";")
+            buffer = []
+            if not statement.strip():
+                continue
+            try:
+                cols, rows = _run(conn, statement)
+                print(_table(cols, rows))
+            except Exception as exc:
+                print(f"{RED}{exc}{RESET}")
+
+
+def cmd_wait(args) -> int:
+    """Poll until the database accepts a connection, or report why it will not."""
+    import socket
+    import time
+
+    details = resolve(args.env, region=args.region)
+    deadline = time.monotonic() + args.timeout
+    attempt = 0
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            with socket.create_connection((details.host, details.port), timeout=5):
+                print(f"{GREEN}{details.host}:{details.port} is accepting connections{RESET}")
+                return 0
+        except OSError as exc:
+            remaining = int(deadline - time.monotonic())
+            print(f"{DIM}attempt {attempt}: {exc.__class__.__name__} — {remaining}s left{RESET}")
+            # A timeout on a public endpoint is almost always one of two things,
+            # and guessing wrong costs ten minutes, so check rather than guess.
+            if attempt == 3:
+                _diagnose(details, args.region)
+            time.sleep(5)
+
+    raise DbError(f"{details.host}:{details.port} did not come up within {args.timeout}s")
+
+
+def _diagnose(details: Connection, region: str) -> None:
+    if not details.instance_id:
+        return
+    try:
+        rds = _aws("rds", region)
+        instance = rds.describe_db_instances(DBInstanceIdentifier=details.instance_id)["DBInstances"][0]
+        status = instance["DBInstanceStatus"]
+        if status != "available":
+            print(f"  {RED}instance status is '{status}'{RESET}", end="")
+            print(" — `db.py start` if it was stopped on schedule" if status == "stopped" else "")
+            return
+        if not instance.get("PubliclyAccessible"):
+            print(f"  {RED}instance has no public endpoint{RESET} — connect through the bastion (`make db-tunnel`)")
+            return
+        print(
+            f"  {DIM}instance is available and public; the security group probably does not"
+            f" list your current IP. Re-run `make apply` to refresh it.{RESET}"
+        )
+    except Exception:
+        pass  # diagnosis is a courtesy, never the reason a command fails
+
+
+def _instance_action(args, action: str) -> int:
+    details = resolve(args.env, region=args.region)
+    if not details.instance_id:
+        raise DbError("no instance id published — is DATABASE_URL pointing somewhere local?")
+    rds = _aws("rds", args.region)
+    method = getattr(rds, f"{action}_db_instance")
+    try:
+        method(DBInstanceIdentifier=details.instance_id)
+    except rds.exceptions.InvalidDBInstanceStateFault as exc:
+        raise DbError(f"cannot {action} {details.instance_id}: {exc}") from exc
+    print(f"{GREEN}{action}ing{RESET} {details.instance_id} — takes a few minutes")
+    return 0
+
+
+def cmd_start(args) -> int:
+    return _instance_action(args, "start")
+
+
+def cmd_stop(args) -> int:
+    return _instance_action(args, "stop")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="db.py",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--env", default=DEFAULT_ENV, help=f"environment (default: {DEFAULT_ENV})")
+    parser.add_argument("--region", default=DEFAULT_REGION, help=f"AWS region (default: {DEFAULT_REGION})")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("url", help="print the connection URL")
+    p.add_argument("--hide-password", action="store_true", help="mask the password")
+    p.set_defaults(func=cmd_url)
+
+    p = sub.add_parser("env", help="print shell exports (PG* and URBAN_RAG_PG*)")
+    p.add_argument("--app", action="store_true", help="the pipeline's role via Secrets Manager, not the master user")
+    p.set_defaults(func=cmd_env)
+
+    sub.add_parser("init", help="apply sql/*.sql (extensions + spatial schema)").set_defaults(func=cmd_init)
+
+    p = sub.add_parser("bootstrap", help="run the dataplatform's pgvector_bootstrap.sql (role + grants)")
+    p.add_argument(
+        "--file",
+        default="../hbu_dataplatform/sql/pgvector_bootstrap.sql",
+        help="path to pgvector_bootstrap.sql (default: %(default)s)",
+    )
+    p.add_argument("--app-user", default="urban_rag", help="role the file creates (default: %(default)s)")
+    p.add_argument("--app-password", help="password to set; generated when omitted")
+    p.add_argument("--store-password", action="store_true", help="write it to the app secret instead of printing it")
+    p.set_defaults(func=cmd_bootstrap)
+
+    p = sub.add_parser("ca", help="download the RDS CA bundle for sslmode=verify-full")
+    p.add_argument("-o", "--output", default=str(CA_BUNDLE), help="where to write it (default: %(default)s)")
+    p.set_defaults(func=cmd_ca)
+    sub.add_parser("check", help="extensions, tables and corpus status").set_defaults(func=cmd_check)
+    sub.add_parser("shell", help="interactive SQL (psql if installed)").set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("query", help="run one statement")
+    p.add_argument("sql", nargs="?", help="SQL to run")
+    p.add_argument("-f", "--file", help="read SQL from a file instead")
+    p.add_argument("--json", action="store_true", help="print rows as JSON")
+    p.set_defaults(func=cmd_query)
+
+    p = sub.add_parser("wait", help="block until the database accepts connections")
+    p.add_argument("--timeout", type=int, default=900, help="seconds to wait (default: 900)")
+    p.set_defaults(func=cmd_wait)
+
+    sub.add_parser("start", help="start a stopped instance").set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="stop the instance").set_defaults(func=cmd_stop)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except DbError as exc:
+        print(f"{RED}error:{RESET} {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        # A driver error here is nearly always the network or the credentials,
+        # not a bug in this script, and a traceback buries the one line that
+        # says which.
+        if type(exc).__module__.split(".")[0] not in {"psycopg", "psycopg2"}:
+            raise
+        print(f"{RED}error:{RESET} {_first_line(exc)}", file=sys.stderr)
+        for hint in _hints(exc, args):
+            print(f"  {DIM}{hint}{RESET}", file=sys.stderr)
+        return 1
+
+
+def _first_line(exc: Exception) -> str:
+    return str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+
+
+def _hints(exc: Exception, args) -> list[str]:
+    """The two or three things that actually cause each failure."""
+    message = str(exc).lower()
+    if "server does not support ssl" in message:
+        return [
+            "the server speaks no TLS — a local container, not RDS.",
+            "add ?sslmode=disable to DATABASE_URL.",
+        ]
+    if "timeout" in message or "could not connect" in message or "no route" in message:
+        return [
+            f"the security group may not list your current IP — re-run `make apply ENV={args.env}`,",
+            f"or the instance may be stopped — `make db-start ENV={args.env}`.",
+        ]
+    if "password authentication failed" in message:
+        return ["the master password rotated — this script re-reads it each run, so retry once."]
+    if "does not exist" in message and "database" in message:
+        return ["the database name in the SSM contract does not match the instance."]
+    return []
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,148 @@
+# hbu_infra — Terraform + database operations
+#
+#   # one-time, in order:
+#   make bootstrap                  # state bucket + lock table (local state)
+#   make apply-shared               # VPC, subnets, DB subnet groups
+#   make apply       ENV=dev        # RDS, security group, SSM contract
+#   make db-init     ENV=dev        # postgis + pgvector + rag schema
+#
+#   # day to day:
+#   make db-shell    ENV=dev        # interactive SQL
+#   make db-check    ENV=dev        # what is installed and loaded
+#   make db-url      ENV=dev        # connection URL for anything else
+#   make plan        ENV=dev
+
+ENV        ?= dev
+AWS_REGION ?= us-east-1
+PROJECT    ?= hbu
+
+# Derived from whichever credentials are active, so the backend never has to be
+# committed and switching AWS_PROFILE switches accounts cleanly.
+ACCOUNT_ID = $(shell aws sts get-caller-identity --query Account --output text)
+BUCKET     = $(PROJECT)-tf-state-$(ACCOUNT_ID)
+LOCK_TABLE = $(PROJECT)-tf-locks
+
+TF        = terraform
+TF_SHARED = terraform -chdir=shared
+TF_BOOT   = terraform -chdir=bootstrap
+
+TF_BACKEND = -backend-config="bucket=$(BUCKET)" \
+             -backend-config="key=$(PROJECT)/$(ENV)/terraform.tfstate" \
+             -backend-config="dynamodb_table=$(LOCK_TABLE)" \
+             -backend-config="encrypt=true"
+
+TF_BACKEND_SHARED = -backend-config="bucket=$(BUCKET)" \
+                    -backend-config="key=$(PROJECT)/shared/terraform.tfstate" \
+                    -backend-config="dynamodb_table=$(LOCK_TABLE)" \
+                    -backend-config="encrypt=true"
+
+TF_VARS = -var-file="$(ENV).tfvars"
+
+DB = ./scripts/db.py --env $(ENV) --region $(AWS_REGION)
+
+.PHONY: help bootstrap init-shared plan-shared apply-shared destroy-shared \
+        init plan apply destroy fmt validate output \
+        db-deps db-init db-check db-shell db-url db-env db-query db-wait \
+        db-start db-stop db-tunnel
+
+help:
+	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+
+bootstrap: ## Create the state bucket and lock table (local state, run once)
+	$(TF_BOOT) init
+	$(TF_BOOT) apply
+
+init-shared: ## terraform init for the shared VPC stack
+	$(TF_SHARED) init -reconfigure $(TF_BACKEND_SHARED)
+
+plan-shared: init-shared ## Plan the shared VPC stack
+	$(TF_SHARED) plan -out=tfplan
+
+apply-shared: ## Apply the shared VPC stack (run plan-shared first)
+	$(TF_SHARED) apply tfplan && rm -f shared/tfplan
+
+# Only safe once every per-env stack is gone: their remote_state lookups fail
+# without the shared outputs.
+destroy-shared: init-shared ## Destroy the shared VPC stack
+	$(TF_SHARED) destroy
+
+init: ## terraform init for ENV
+	$(TF) init -reconfigure $(TF_BACKEND)
+
+plan: init ## Plan ENV
+	$(TF) plan $(TF_VARS) -out=tfplan
+
+apply: ## Apply ENV (run plan first)
+	$(TF) apply tfplan && rm -f tfplan
+
+destroy: init ## Destroy ENV
+	$(TF) destroy $(TF_VARS)
+
+fmt: ## Rewrite all .tf files to canonical format
+	$(TF) fmt -recursive .
+
+validate: init ## Validate the per-env configuration
+	$(TF) validate
+
+output: ## Show ENV outputs
+	$(TF) output
+
+# ---------------------------------------------------------------------------
+# Database
+#
+# Every target below resolves the endpoint and password from SSM and Secrets
+# Manager at call time, so none of them take a host or a password argument and
+# none of them break when the instance is replaced.
+# ---------------------------------------------------------------------------
+
+db-deps: ## Install what scripts/db.py needs (boto3, psycopg)
+	python3 -m pip install -r scripts/requirements.txt
+
+db-init: ## Apply sql/*.sql — extensions, rag.features, rag.lots, spatial search
+	$(DB) init
+
+# The role and grants live in the dataplatform, because that is the repo whose
+# code connects as that role. Run from here, where the master credentials are.
+DATAPLATFORM ?= ../hbu_dataplatform
+db-bootstrap: ## Create the urban_rag role + grants, storing its password in Secrets Manager
+	$(DB) bootstrap --file $(DATAPLATFORM)/sql/pgvector_bootstrap.sql --store-password
+
+db-ca: ## Download the RDS root certificate that sslmode=verify-full needs
+	$(DB) ca
+
+db-check: ## Report extensions, tables, and what is loaded
+	$(DB) check
+
+db-shell: ## Interactive SQL (psql when installed, built-in REPL otherwise)
+	$(DB) shell
+
+db-url: ## Print the connection URL
+	$(DB) url
+
+db-env: ## Master-user exports — use as: eval "$$(make -s db-env)"
+	@$(DB) env
+
+db-app-env: ## Pipeline-role exports (URBAN_RAG_PG_*, password via Secrets Manager)
+	@$(DB) env --app
+
+db-query: ## Run one statement: make db-query SQL="select 1"
+	$(DB) query "$(SQL)"
+
+db-wait: ## Block until the instance accepts connections
+	$(DB) wait
+
+db-start: ## Start a stopped instance
+	$(DB) start
+
+db-stop: ## Stop the instance
+	$(DB) stop
+
+# Only for a database with no public endpoint. Leaves psql-able postgres on
+# localhost:$(LOCAL_PORT) for as long as the session is open.
+LOCAL_PORT ?= 5433
+db-tunnel: ## Port-forward through the SSM bastion to localhost:$(LOCAL_PORT)
+	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)

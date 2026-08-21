@@ -1,0 +1,21 @@
+# Terraform
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider versions
+# so two machines plan against the same AWS provider.
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+# Never commit a tfvars that holds a real value; the committed dev/prod ones
+# hold only sizing and toggles.
+*.auto.tfvars
+override.tf
+override.tf.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local
+.env

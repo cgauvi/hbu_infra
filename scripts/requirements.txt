@@ -1,0 +1,5 @@
+# Everything scripts/db.py needs. psycopg[binary] bundles libpq, so there is no
+# system postgresql-client to install first — which matters because the whole
+# point of db.py is that it works on a machine with nothing set up.
+boto3>=1.34
+psycopg[binary]>=3.1
