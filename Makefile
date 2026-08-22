@@ -50,7 +50,17 @@ TF_BACKEND_SHARED = -backend-config="bucket=$(BUCKET)" \
 
 TF_VARS = -var-file="$(ENV).tfvars"
 
-DB = ./scripts/db.py --env $(ENV) --region $(AWS_REGION)
+# With no public endpoint there is no route from a laptop to the instance, so
+# every db-* target can be pointed at an open `make db-tunnel` session instead:
+#
+#   make db-tunnel ENV=dev              # one shell, left running
+#   make db-check  ENV=dev TUNNEL=1     # another
+#
+# Only the address is swapped; the credentials still come from AWS.
+LOCAL_PORT ?= 5433
+TUNNEL     ?=
+
+DB = ./scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tunnel $(LOCAL_PORT))
 
 .PHONY: help bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
@@ -165,6 +175,5 @@ db-stop: ## Stop the instance
 
 # Only for a database with no public endpoint. Leaves psql-able postgres on
 # localhost:$(LOCAL_PORT) for as long as the session is open.
-LOCAL_PORT ?= 5433
 db-tunnel: ## Port-forward through the SSM bastion to localhost:$(LOCAL_PORT)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)

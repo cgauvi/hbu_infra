@@ -22,6 +22,10 @@ Set ``DATABASE_URL`` to bypass AWS resolution entirely — a local
 postgis+pgvector container, or an already-open SSM tunnel. Append
 ``?sslmode=disable`` for a server that speaks no TLS.
 
+``--tunnel`` is the lighter version of that, and what the private posture
+needs: credentials, database name, and instance id still come from AWS, and
+only the address is redirected to an open ``make db-tunnel`` session.
+
 Two databases' worth of ownership meet here, and the split matters:
 ``rag.chunks`` belongs to hbu_dataplatform, which creates it on first load;
 this repo's sql/ owns the roles that schema belongs to, the extensions, the
@@ -42,7 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
@@ -172,6 +176,13 @@ def _from_url(url: str) -> Connection:
     )
 
 
+#: Set by --tunnel. A database with no public endpoint is reachable only
+#: through `make db-tunnel`, but everything except the address is unchanged, so
+#: this swaps the host and port after resolution rather than before it: the
+#: credentials, the database name, and the instance id still come from AWS.
+_LOCAL_PORT: int | None = None
+
+
 def resolve(
     env: str = DEFAULT_ENV,
     *,
@@ -180,9 +191,10 @@ def resolve(
 ) -> Connection:
     """Connection details, from DATABASE_URL if set and from AWS otherwise."""
     override = os.environ.get("DATABASE_URL")
-    if override:
-        return _from_url(override)
-    return _from_ssm(project, env, region)
+    details = _from_url(override) if override else _from_ssm(project, env, region)
+    if _LOCAL_PORT is not None:
+        details = replace(details, host="localhost", port=_LOCAL_PORT)
+    return details
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +685,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env", default=DEFAULT_ENV, help=f"environment (default: {DEFAULT_ENV})")
     parser.add_argument("--region", default=DEFAULT_REGION, help=f"AWS region (default: {DEFAULT_REGION})")
+    parser.add_argument(
+        "--tunnel",
+        nargs="?",
+        const=5433,
+        type=int,
+        metavar="PORT",
+        help="connect through an open `make db-tunnel` session on localhost:PORT (default: 5433)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("url", help="print the connection URL")
@@ -714,6 +734,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.tunnel:
+        global _LOCAL_PORT
+        _LOCAL_PORT = args.tunnel
     try:
         return args.func(args)
     except DbError as exc:
@@ -747,7 +770,9 @@ def _hints(exc: Exception, args) -> list[str]:
         ]
     if "timeout" in message or "could not connect" in message or "no route" in message:
         return [
-            f"the security group may not list your current IP — re-run `make apply ENV={args.env}`,",
+            f"the instance may have no public endpoint — open `make db-tunnel ENV={args.env}`",
+            "  in another shell and re-run this with TUNNEL=1,",
+            f"or the security group may not list your current IP — re-run `make apply ENV={args.env}`,",
             f"or the instance may be stopped — `make db-start ENV={args.env}`.",
         ]
     if "password authentication failed" in message:

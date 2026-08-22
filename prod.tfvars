@@ -19,7 +19,13 @@ enable_scheduled_shutdown = false
 enable_bastion            = false
 
 # The private posture, once ECS is talking to the database and a laptop no
-# longer needs to:
-#   db_subnet_tier         = "private"   # replaces the instance
+# longer needs to. dev already runs it:
+#   db_subnet_tier         = "private"
 #   db_publicly_accessible = false
+#   allow_current_ip       = false
 #   enable_bastion         = true
+#
+# Changing the tier REPLACES the instance -- RDS refuses to move one between
+# subnet groups inside a single VPC -- and the plan will claim otherwise unless
+# you pass -replace=aws_db_instance.main. On prod that means a snapshot restore
+# rather than the empty rebuild dev got. See "Reachability" in the README.
