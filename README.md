@@ -95,9 +95,27 @@ make db-deps           # boto3 + psycopg for scripts/db.py
 
 `AWS_PROFILE` no longer needs exporting — the Makefile pins it to
 `charles_gauvin_east_1` (account `038083667790`, where this stack lives) and
-exports it to every target. Pass `AWS_PROFILE=<other> make ...` to override.
-Note that `make db-deps` installs into whichever virtualenv is active, since
-`uv pip install` targets `$VIRTUAL_ENV`.
+exports it to every target. Pass `AWS_PROFILE=<other> make ...` to override, and
+`AWS_ACCOUNT=<id>` with it, because every AWS-touching target runs `aws-check`
+first and refuses to continue unless the active credentials really are in
+`AWS_ACCOUNT`. That check exists because the alternative is silent: with the
+wrong credentials, both the state bucket and the `/hbu-<env>` parameter
+namespace resolve against an account where none of it exists, and the first
+symptom is an `AccessDenied` several steps in. Two ways to end up there — a
+shell exporting `AWS_PROFILE=` (empty still counts as set, so the pin used to
+fall through to the default profile) and a stray `AWS_ACCESS_KEY_ID` pair, which
+botocore reads *before* it ever looks at `AWS_PROFILE` — are both handled in the
+Makefile now; the keys behind the profile going stale is not, and shows up as
+`aws-check` reporting `InvalidClientTokenId`. Set `AWS_USE_ENV_CREDS=1` to keep
+credentials from the environment instead of a profile.
+`make db-deps` installs into whichever virtualenv is active and creates one when
+none is — `.venv` under Linux and WSL, `.venv-win` in a native Windows shell. A
+venv bakes in its layout and the absolute path of the interpreter that built it,
+so one directory cannot serve both kernels; whichever shell ran `db-deps` last
+would own it. `db-deps` installs uv first if uv is missing — there is no pip
+fallback, because a uv-made venv has no pip. Every `db-*` target then runs
+`scripts/db.py` with that venv's interpreter, so no `python3` on PATH is
+required.
 
 ### 1. State backend (once per account)
 
