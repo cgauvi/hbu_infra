@@ -63,6 +63,22 @@ resource "aws_cloudwatch_log_group" "postgresql" {
 }
 
 # ---------------------------------------------------------------------------
+# Subnet tier changes are replacements, not modifications
+#
+# ModifyDBInstance accepts a new DB subnet group only when it moves the
+# instance to a *different* VPC; inside one VPC it answers
+# InvalidVPCNetworkStateFault. The provider does not model that, so changing
+# db_subnet_tier plans as a clean in-place update and then fails half way
+# through an apply. Keying a trigger to the tier states the truth up front:
+# public -> private is a new instance, planned as one and visible before
+# anyone types yes.
+# ---------------------------------------------------------------------------
+
+resource "terraform_data" "db_subnet_tier" {
+  input = var.db_subnet_tier
+}
+
+# ---------------------------------------------------------------------------
 # The instance
 # ---------------------------------------------------------------------------
 
@@ -118,6 +134,8 @@ resource "aws_db_instance" "main" {
   depends_on = [aws_cloudwatch_log_group.postgresql]
 
   lifecycle {
+    replace_triggered_by = [terraform_data.db_subnet_tier]
+
     ignore_changes = [
       # A bare major version ("16") is normalised by RDS to whatever minor it
       # actually launched, and auto_minor_version_upgrade moves it again.

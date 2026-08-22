@@ -1,9 +1,12 @@
 environment = "dev"
 
-# Reachable from a laptop, locked to the applying machine's public IP.
-db_subnet_tier         = "public"
-db_publicly_accessible = true
-allow_current_ip       = true
+# The private posture: the instance sits in subnets with no route off the VPC
+# and has no public endpoint, so the only way in is the bastion's security
+# group. Nothing is pinned to a home IP any more, which is the point -- a
+# changing address no longer means re-applying the security group.
+db_subnet_tier         = "private"
+db_publicly_accessible = false
+allow_current_ip       = false
 
 # Sizing is an HNSW question, not a storage one: the index has to fit in
 # memory to be fast, at roughly rows x dimension x 4 bytes plus the graph.
@@ -24,4 +27,7 @@ db_skip_final_snapshot   = true
 # of the work is familiar.
 enable_scheduled_shutdown = false
 
-enable_bastion = false
+# Required by the above: with no public endpoint this is the only path from a
+# laptop. `make db-tunnel` port-forwards through it over Session Manager, and
+# every db-* target then runs against localhost.
+enable_bastion = true

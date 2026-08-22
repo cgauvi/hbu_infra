@@ -31,26 +31,34 @@ does not own — and `dev` and `prod` differ only by their `.tfvars` and their
 state key.
 
 ```
-Internet
-    │  :5432, only from the CIDRs the security group lists
+Laptop
+    │  aws ssm start-session — IAM, no open port, no VPN
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Shared VPC (10.20.0.0/16)                            │
-│                                                        │
-│  public  ─ RDS PostgreSQL 16                          │
-│            postgis · pgvector · pg_trgm               │
-│            rag.chunks        ← hbu_dataplatform       │
-│            rag.features      ← this repo              │
-│            rag.lots          ← this repo              │
-│            rag.buildings     ← this repo              │
-│            rag.building_lots ← this repo              │
-│                                                        │
-│  private ─ (empty; for ECS, when there is an app)     │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Shared VPC (10.20.0.0/16)                              │
+│                                                         │
+│  public  ─ SSM bastion (t4g.nano; egress only, no key)  │
+│                 │                                       │
+│                 │ :5432, its security group to the      │
+│                 ▼ database's — no CIDR anywhere         │
+│  private ─ RDS PostgreSQL 16 — no public endpoint       │
+│            postgis · pgvector · pg_trgm                 │
+│            rag.chunks        ← hbu_dataplatform         │
+│            rag.features      ← this repo                │
+│            rag.lots          ← this repo                │
+│            rag.buildings     ← this repo                │
+│            rag.building_lots ← this repo                │
+└─────────────────────────────────────────────────────────┘
 ```
 
+That is `dev`. **`prod` is still the public posture** — a public endpoint
+locked to the applying machine's IP — because nothing but a laptop talks to it
+yet; see [Reachability](#reachability-and-the-tradeoff).
+
 There is deliberately **no NAT gateway**: nothing in the private tier needs
-outbound internet, and a NAT would cost more per month than the database.
+outbound internet, and a NAT would cost more per month than the database. The
+bastion sits in a public subnet with a public IP for the same reason — the SSM
+agent has to reach Session Manager outbound, and nothing can reach it inbound.
 
 ---
 
@@ -135,11 +143,21 @@ make apply-shared
 ```bash
 make plan  ENV=dev
 make apply ENV=dev
-make db-wait ENV=dev   # RDS takes ~5–10 min to come up
 ```
 
-`allow_current_ip = true` means the applying machine's public address is
-allowlisted automatically — re-apply after your ISP hands you a new one.
+`dev` comes up with no public endpoint, so everything after this goes through
+the tunnel: one shell holds it open, the rest of the work happens in another.
+
+```bash
+make db-tunnel ENV=dev            # leave running; Ctrl-C closes it
+make db-wait   ENV=dev TUNNEL=1   # RDS takes ~5–10 min to come up
+```
+
+Every `db-*` target takes `TUNNEL=1`, which swaps the address for
+`localhost:5433` and resolves the credentials from AWS exactly as before.
+
+`prod` still sets `allow_current_ip = true`, which allowlists the applying
+machine's public address — re-apply there after your ISP hands you a new one.
 
 ### 4. Bootstrap the database
 
@@ -148,10 +166,10 @@ What only `db-bootstrap` does is set the role's password: until it has run,
 `urban_rag` exists but cannot log in.
 
 ```bash
-make db-ca                    # RDS root cert, for sslmode=verify-full
-make db-bootstrap ENV=dev     # urban_rag role + grants, password → Secrets Manager
-make db-init      ENV=dev     # extensions, rag.features, rag.lots, rag.buildings, rag.building_lots
-make db-check     ENV=dev
+make db-ca                             # RDS root cert, for sslmode=verify-full
+make db-bootstrap ENV=dev TUNNEL=1     # urban_rag role + grants, password → Secrets Manager
+make db-init      ENV=dev TUNNEL=1     # extensions, rag.features, rag.lots, rag.buildings, rag.building_lots
+make db-check     ENV=dev TUNNEL=1
 ```
 
 `db-init` will report `003_spatial_search.sql skipped — rag.chunks does not
@@ -170,13 +188,22 @@ password in Secrets Manager and rotates it, and
 break when the instance is replaced.
 
 ```bash
-make db-shell  ENV=dev              # interactive SQL (psql if installed, REPL if not)
-make db-check  ENV=dev              # extensions, tables, corpus, index metadata
-make db-query  ENV=dev SQL="select * from rag.corpus_status"
-make db-url    ENV=dev              # a connection URL for QGIS, DBeaver, psycopg
-eval "$(make -s db-env ENV=dev)"    # PG* and URBAN_RAG_PG_* in the shell
-eval "$(make -s db-app-env ENV=dev)" # the pipeline's role, password via Secrets Manager
+make db-tunnel ENV=dev                    # one shell, left running
+
+make db-shell  ENV=dev TUNNEL=1           # interactive SQL (psql if installed, REPL if not)
+make db-check  ENV=dev TUNNEL=1           # extensions, tables, corpus, index metadata
+make db-query  ENV=dev TUNNEL=1 SQL="select * from rag.corpus_status"
+make db-url    ENV=dev TUNNEL=1           # a localhost URL for QGIS, DBeaver, psycopg
+eval "$(make -s db-env ENV=dev TUNNEL=1)" # PG* and URBAN_RAG_PG_* in the shell
+eval "$(make -s db-app-env ENV=dev)"      # the pipeline's role, password via Secrets Manager
 ```
+
+`TUNNEL=1` swaps the address for `localhost:5433` and nothing else —
+the credentials, the database name, and the instance id still come from AWS. It
+is required for `dev`, which has no public endpoint, and pointless for `prod`,
+which does. Pass `LOCAL_PORT=<n>` to both targets to use a different port.
+`db-app-env` never needs it: it is read by things running inside the VPC, which
+reach the endpoint directly.
 
 `db.py` is importable too, which is the point of the `connect` helper:
 
@@ -203,6 +230,19 @@ apply from reverting it to the placeholder. IAM authentication is enabled on
 the instance as an alternative, for the path where nothing stores a password at
 all — the role still needs `GRANT rds_iam`, which is commented out in the
 dataplatform's bootstrap file.
+
+
+### Getting the DB credentials
+
+The output of `make output` prints out the command to fetch the credentials. However some ' around the arn are required to make it work:
+
+```
+AWS_PROFILE=charles_gauvin_east_1 aws secretsmanager get-secret-value \
+--secret-id 'arn:aws:secretsmanager:us-east-1:038083667790:secret:rds!db-d901b57d-5605-45a7-96b0-6faa2cc6568b-MeQ37g' \
+--region us-east-1 \
+--query SecretString \
+--output text
+```
 
 ---
 
@@ -235,24 +275,56 @@ rows costs more than reading them — and it means recall in `search_near` is
 
 ## Reachability, and the tradeoff
 
-The default is a **public endpoint locked to your IP**, because it is the
-posture in which every command above works from a laptop with nothing else set
-up. Access is gated entirely by the security group, and `rds.force_ssl = 1`
-means the traffic is TLS whatever the client asks for.
-
-It is still a database on the public internet. The private posture is two
-variables and a bastion:
+`dev` runs the **private posture**: the instance sits in subnets with no route
+off the VPC, it has no public endpoint, and its security group names no CIDR at
+all — the only ingress is the bastion's security group.
 
 ```hcl
-db_subnet_tier         = "private"   # NOTE: replaces the instance
+db_subnet_tier         = "private"
 db_publicly_accessible = false
+allow_current_ip       = false
 enable_bastion         = true
 ```
 
-Then `make db-tunnel ENV=dev` port-forwards 5432 to `localhost:5433` through
-Session Manager — no SSH key, no open port, no VPN. Access becomes IAM, revoked
-by removing a permission rather than by rotating a key that is already on three
-laptops.
+`make db-tunnel ENV=dev` port-forwards 5432 to `localhost:5433` through Session
+Manager — no SSH key, no open port, no VPN. Access is IAM, revoked by removing a
+permission rather than by rotating a key that is already on three laptops, and
+nothing is pinned to a home IP address, so a new one from your ISP costs
+nothing.
+
+`prod` is still the **public posture**: a public endpoint whose security group
+lists exactly one CIDR, the applying machine's. It is the posture in which every
+command works from a laptop with nothing else set up, and `rds.force_ssl = 1`
+means the traffic is TLS whatever the client asks for. It is also still a
+database on the public internet.
+
+### Changing tier replaces the instance
+
+Not modifies — replaces. `ModifyDBInstance` accepts a new DB subnet group only
+when it moves the instance to a *different* VPC; inside one VPC it answers:
+
+```
+InvalidVPCNetworkStateFault: You cannot move DB instance hbu-dev to subnet group
+hbu-private. The specified DB subnet group and DB instance are in the same VPC.
+```
+
+The AWS provider does not model that, so the change plans as a clean in-place
+update and then fails half way through the apply — after, in the case that
+prompted this note, the old CIDR rule had already been destroyed.
+`terraform_data.db_subnet_tier` in [`rds.tf`](rds.tf) exists to keep the plan
+honest: the tier feeds a `replace_triggered_by`, so changing it shows up as the
+replacement it is. The *first* move still needs `-replace` by hand, since a
+trigger created in the same apply has no previous value to differ from:
+
+```bash
+terraform plan -var-file=dev.tfvars -replace=aws_db_instance.main -out=tfplan
+terraform apply tfplan
+```
+
+Budget ~15 minutes, and re-run `db-bootstrap` and `db-init` afterwards: the new
+instance is empty and its master password is a new secret. Nothing has to be
+edited by hand — the SSM contract and the IAM policy's `rds-db:connect` resource
+are all derived from the resource, so they re-publish themselves.
 
 Terraform will warn (not fail) if you turn off both the public endpoint and the
 bastion, since that leaves nothing outside the VPC able to connect — a fine end
@@ -269,7 +341,7 @@ Roughly, in `us-east-1`, for the dev defaults:
 | db.t4g.micro, single-AZ | ~$12/mo |
 | 20 GiB gp3 | ~$2/mo |
 | Backups (1 day, dev) | pennies |
-| Bastion (t4g.nano, off by default) | ~$3/mo |
+| Bastion t4g.nano + its public IPv4 (on for `dev`) | ~$7/mo |
 
 `enable_scheduled_shutdown = true` adds EventBridge schedules that stop the
 instance overnight and start it in the morning, through the RDS API directly —

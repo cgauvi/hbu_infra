@@ -98,6 +98,16 @@ TF_BACKEND_SHARED = -backend-config="bucket=$(BUCKET)" \
 
 TF_VARS = -var-file="$(ENV).tfvars"
 
+# With no public endpoint there is no route from a laptop to the instance, so
+# every db-* target can be pointed at an open `make db-tunnel` session instead:
+#
+#   make db-tunnel ENV=dev              # one shell, left running
+#   make db-check  ENV=dev TUNNEL=1     # another
+#
+# Only the address is swapped; the credentials still come from AWS.
+LOCAL_PORT ?= 5433
+TUNNEL     ?=
+
 # A native Windows uv launched from msys2's sh can inherit no TMP at all, fall
 # back to C:\WINDOWS and die with "Access is denied"; cygpath gives it a real
 # one. No-op on Linux and on any shell that already sets TMP.
@@ -139,7 +149,7 @@ endif
 # choose their CLI path instead of running an empty command.
 PY = $$(V="$${VIRTUAL_ENV:-$(VENV)}"; for p in $(PY_NAMES); do [ -e "$$V/$$p" ] && { echo "$$V/$$p"; exit; }; done; echo "$$V/$(firstword $(PY_NAMES))")
 
-DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION)
+DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tunnel $(LOCAL_PORT))
 
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
@@ -310,6 +320,5 @@ db-stop: ## Stop the instance
 
 # Only for a database with no public endpoint. Leaves psql-able postgres on
 # localhost:$(LOCAL_PORT) for as long as the session is open.
-LOCAL_PORT ?= 5433
 db-tunnel: ## Port-forward through the SSM bastion to localhost:$(LOCAL_PORT)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)
