@@ -1,10 +1,10 @@
 -- Extensions. Run once per database, as the RDS master user — the role RDS
 -- gives rds_superuser, which is what CREATE EXTENSION requires here.
 --
--- This is the half of the bootstrap that infrastructure owns. The other half —
--- the `urban_rag` login role, the `rag` schema it owns, and the grants — lives
--- in the dataplatform's sql/pgvector_bootstrap.sql, because that is the repo
--- whose code connects as that role. `make db-bootstrap` runs it from here.
+-- The `urban_rag` login role, the `rag` schema it owns, and the grants live in
+-- 000_roles.sql, which sorts before this file and has therefore already run by
+-- the time this one does. `vector` is created here rather than there because
+-- extensions are one thing and roles are another.
 --
 -- IF NOT EXISTS throughout, so this is safe to re-run: db.py applies every
 -- file in sql/ in name order on each `db-init`.

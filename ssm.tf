@@ -43,7 +43,7 @@ resource "aws_ssm_parameter" "db_secret_arn" {
 
 resource "aws_ssm_parameter" "db_instance_id" {
   name        = "/${local.prefix}/db/instance_id"
-  description = "RDS instance identifier — used by scripts/db.py to report whether a stopped instance is why a connection is timing out"
+  description = "RDS instance identifier - used by scripts/db.py to report whether a stopped instance is why a connection is timing out"
   type        = "String"
   value       = aws_db_instance.main.identifier
 }
@@ -52,8 +52,8 @@ resource "aws_ssm_parameter" "db_instance_id" {
 # The application role
 #
 # The pipeline does not connect as the master user. It connects as `urban_rag`,
-# a login role that owns the `rag` schema and nothing else — created by the
-# dataplatform's sql/pgvector_bootstrap.sql, which `make db-bootstrap` runs.
+# a login role that owns the `rag` schema and nothing else — created by
+# sql/000_roles.sql, which `make db-bootstrap` applies.
 #
 # Terraform creates the secret that role's password lives in but never sets it:
 # the value is written by `db.py bootstrap --store-password`, which generates
@@ -87,7 +87,7 @@ resource "aws_secretsmanager_secret_version" "app_role" {
 
 resource "aws_ssm_parameter" "db_app_secret_arn" {
   name        = "/${local.prefix}/db/app_secret_arn"
-  description = "Secrets Manager ARN holding the ${var.app_db_username} role password — URBAN_RAG_PG_SECRET_ID"
+  description = "Secrets Manager ARN holding the ${var.app_db_username} role password - URBAN_RAG_PG_SECRET_ID"
   type        = "String"
   value       = aws_secretsmanager_secret.app_role.arn
 }

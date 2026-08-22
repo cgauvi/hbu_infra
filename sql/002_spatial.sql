@@ -13,10 +13,9 @@
 --
 -- Owned by the same role that owns rag.chunks, so a single GRANT covers both.
 
--- The schema is normally created by the dataplatform's bootstrap, owned by the
--- pipeline's role. Created here too so this file stands alone on a database
--- where the bootstrap has not run yet; the ownership block at the end settles
--- who owns it either way.
+-- The schema is created by 000_roles.sql, owned by the pipeline's role.
+-- Created here too so this file stands alone on a database where that has not
+-- run yet; the ownership block at the end settles who owns it either way.
 CREATE SCHEMA IF NOT EXISTS rag;
 
 SET search_path TO rag, public;
@@ -71,16 +70,38 @@ CREATE INDEX IF NOT EXISTS lots_geom_idx ON rag.lots USING gist (geom);
 CREATE INDEX IF NOT EXISTS lots_number_idx ON rag.lots (lot_number);
 
 -- ---------------------------------------------------------------------------
+-- Buildings — footprints from StatCan's Open Database of Buildings (BDOI)
+--
+-- No natural key survives from BDOI itself (the source carries no stable id
+-- across extracts, unlike Infolot's lot number), so unlike rag.lots this
+-- table has no UNIQUE constraint to upsert against: a load replaces a
+-- (neighborhood, scrape_date) partition wholesale — delete then insert —
+-- the same snapshot semantics the geoparquet tree already has.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS rag.buildings (
+    building_uid bigserial PRIMARY KEY,
+    neighborhood text NOT NULL,
+    scrape_date  date NOT NULL,
+    area_m2      double precision,
+    attributes   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    geom         geometry(MultiPolygon, 4326)
+);
+
+CREATE INDEX IF NOT EXISTS buildings_geom_idx ON rag.buildings USING gist (geom);
+CREATE INDEX IF NOT EXISTS buildings_partition_idx
+    ON rag.buildings (neighborhood, scrape_date);
+
+-- ---------------------------------------------------------------------------
 -- Ownership
 --
 -- These tables are created by the master user, because only it can install
 -- PostGIS — but everything in the `rag` schema is meant to be owned by the
 -- pipeline's role, which is what the dataplatform's grants are written
--- against. Handing them over here keeps one owner for the whole schema
--- regardless of which of the two bootstrap steps ran first.
+-- against. Handing them over here keeps one owner for the whole schema.
 --
 -- Guarded on the role existing, so this file also works on a database where
--- pgvector_bootstrap.sql has not been run yet.
+-- 000_roles.sql has not been run yet.
 -- ---------------------------------------------------------------------------
 
 DO $$
@@ -91,8 +112,8 @@ DECLARE
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app_role) THEN
         RAISE NOTICE
-            'role % does not exist — run the dataplatform''s pgvector_bootstrap.sql, '
-            'then re-run this file to hand over ownership', app_role;
+            'role % does not exist — apply 000_roles.sql, then re-run this '
+            'file to hand over ownership', app_role;
         RETURN;
     END IF;
 
@@ -100,7 +121,7 @@ BEGIN
 
     -- ALTER TABLE ... OWNER TO carries owned sequences with it, so the
     -- bigserial columns need no separate statement.
-    FOREACH relation IN ARRAY ARRAY['rag.features', 'rag.lots'] LOOP
+    FOREACH relation IN ARRAY ARRAY['rag.features', 'rag.lots', 'rag.buildings'] LOOP
         EXECUTE format('ALTER TABLE %s OWNER TO %I', relation, app_role);
     END LOOP;
 

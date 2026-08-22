@@ -106,12 +106,12 @@ resource "aws_route_table_association" "private" {
 
 resource "aws_db_subnet_group" "public" {
   name        = "${local.prefix}-public"
-  description = "Public subnets — for an RDS instance with publicly_accessible = true"
+  description = "Public subnets - for an RDS instance with publicly_accessible = true"
   subnet_ids  = aws_subnet.public[*].id
 }
 
 resource "aws_db_subnet_group" "private" {
   name        = "${local.prefix}-private"
-  description = "Private subnets — for an RDS instance reachable only from inside the VPC"
+  description = "Private subnets - for an RDS instance reachable only from inside the VPC"
   subnet_ids  = aws_subnet.private[*].id
 }

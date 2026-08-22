@@ -9,7 +9,7 @@ every time the instance is replaced, or a password that has to be pasted.
     ./scripts/db.py url                  # connection URL, password included
     ./scripts/db.py env [--app]          # shell exports; --app for the pipeline role
     ./scripts/db.py ca                   # RDS root cert, for sslmode=verify-full
-    ./scripts/db.py bootstrap            # the dataplatform's role + grants file
+    ./scripts/db.py bootstrap            # roles + grants, and the app password
     ./scripts/db.py init                 # apply sql/*.sql in name order
     ./scripts/db.py check                # extensions, tables, corpus, index metadata
     ./scripts/db.py shell                # psql, or a REPL if psql is absent
@@ -24,8 +24,8 @@ postgis+pgvector container, or an already-open SSM tunnel. Append
 
 Two databases' worth of ownership meet here, and the split matters:
 ``rag.chunks`` belongs to hbu_dataplatform, which creates it on first load;
-this repo's sql/ owns the extensions, the spatial tables, and the functions
-that join the two. See the README.
+this repo's sql/ owns the roles that schema belongs to, the extensions, the
+spatial tables, and the functions that join the two. See the README.
 
 Importable too, which is the point of the ``connect`` helper:
 
@@ -348,20 +348,6 @@ def _requires(sql: str) -> str | None:
     return None
 
 
-def _requires(sql: str) -> str | None:
-    """The relation a file names in a leading `-- requires: <name>` comment."""
-    for line in sql.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if not stripped.startswith("--"):
-            break
-        match = re.match(r"--\s*requires:\s*(\S+)", stripped)
-        if match:
-            return match.group(1)
-    return None
-
-
 def cmd_init(args) -> int:
     details = resolve(args.env, region=args.region)
     files = sorted(SQL_DIR.glob("*.sql"))
@@ -404,69 +390,45 @@ def cmd_init(args) -> int:
     return 0
 
 
-# psql meta-commands this has to understand to run a file written for psql.
-_PSQL_SET = re.compile(r"^\\set\s+(\S+)(?:\s+(.*))?$")
+#: Applied by `bootstrap` as well as by `init` — which is why it sorts first.
+ROLES_FILE = "000_roles.sql"
 
 
 def cmd_bootstrap(args) -> int:
-    """Run the dataplatform's pgvector_bootstrap.sql as the master user.
+    """Create the app roles, then give the pipeline's role its password.
 
-    That file creates the `urban_rag` login role, the `rag` schema it owns, and
-    the grants — the things the pipeline's own role is deliberately not
-    privileged enough to create for itself. It lives in the dataplatform
-    because that is the repo whose code connects as that role; it runs from
-    here because this is where the master credentials are.
-
-    It is written for psql, so the few backslash meta-commands it uses are
-    interpreted here instead of requiring psql to be installed.
+    `sql/000_roles.sql` creates the `urban_rag` login role, the `rag` schema it
+    owns and the grants — the things the pipeline's own role is deliberately
+    not privileged enough to create for itself. `init` applies that file too,
+    in name order, so what is only ever done here is the credential: generate a
+    password, set it, and put it where the pipeline reads it from.
     """
     import secrets as secrets_module
 
-    path = Path(args.file)
+    path = SQL_DIR / ROLES_FILE
     if not path.exists():
-        raise DbError(
-            f"{path} not found — pass --file with the path to the dataplatform's "
-            "sql/pgvector_bootstrap.sql"
-        )
+        raise DbError(f"{path} not found — it is applied from this repo's sql/")
 
     details = resolve(args.env, region=args.region)
     password = args.app_password or secrets_module.token_urlsafe(24)
 
-    variables: dict[str, str] = {}
-    body: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("\\"):
-            match = _PSQL_SET.match(stripped)
-            # `\set name value` defines a substitution; `\set ON_ERROR_STOP on`
-            # and every other meta-command is a psql-ism with no SQL meaning.
-            if match and match.group(2) and match.group(1).islower():
-                variables[match.group(1)] = match.group(2).strip()
-            continue
-        body.append(line)
-
-    # Quoted: it is substituted into ALTER ROLE ... WITH PASSWORD, where psql
-    # would have passed it as a literal too.
-    variables["app_password"] = "'" + password.replace("'", "''") + "'"
-
-    rendered = "\n".join(body)
-    # Longest name first, so :app_user is not clipped by a shorter :app.
-    for name in sorted(variables, key=len, reverse=True):
-        rendered = rendered.replace(":" + name, variables[name])
-
-    # Anything still looking like :name would reach Postgres as a syntax error
-    # twenty statements in; catching it here says which variable was missing.
-    uncommented = re.sub(r"(?m)--.*$", "", rendered).replace("::", " ")
-    leftovers = sorted(set(re.findall(r"(?<![:\w]):([a-z_]{2,})", uncommented)))
-    if leftovers:
-        raise DbError(f"unsubstituted psql variables in {path.name}: {', '.join(leftovers)}")
-
     with connect(connection=details) as conn:
         print(f"applying {path.name} as {details.user}")
         try:
-            _run(conn, rendered)
+            _run(conn, path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise DbError(f"{path.name} failed: {exc}") from exc
+
+        # ALTER ROLE ... PASSWORD takes a literal, not a bind parameter, so the
+        # value has to be rendered into the statement rather than sent beside
+        # it. Doubling any quote is the whole of the escaping that needs, and a
+        # generated password has none to double.
+        role = '"' + args.app_user.replace('"', '""') + '"'
+        literal = "'" + password.replace("'", "''") + "'"
+        try:
+            _run(conn, f"ALTER ROLE {role} WITH PASSWORD {literal}")
+        except Exception as exc:
+            raise DbError(f"setting the {args.app_user} password failed: {exc}") from exc
     print(f"  {GREEN}ok{RESET}")
 
     if args.store_password:
@@ -723,13 +685,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="apply sql/*.sql (extensions + spatial schema)").set_defaults(func=cmd_init)
 
-    p = sub.add_parser("bootstrap", help="run the dataplatform's pgvector_bootstrap.sql (role + grants)")
-    p.add_argument(
-        "--file",
-        default="../hbu_dataplatform/sql/pgvector_bootstrap.sql",
-        help="path to pgvector_bootstrap.sql (default: %(default)s)",
-    )
-    p.add_argument("--app-user", default="urban_rag", help="role the file creates (default: %(default)s)")
+    p = sub.add_parser("bootstrap", help="apply sql/000_roles.sql and set the app role's password")
+    p.add_argument("--app-user", default="urban_rag", help="role to set the password on (default: %(default)s)")
     p.add_argument("--app-password", help="password to set; generated when omitted")
     p.add_argument("--store-password", action="store_true", help="write it to the app secret instead of printing it")
     p.set_defaults(func=cmd_bootstrap)

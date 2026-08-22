@@ -4,6 +4,7 @@
 #   make bootstrap                  # state bucket + lock table (local state)
 #   make apply-shared               # VPC, subnets, DB subnet groups
 #   make apply       ENV=dev        # RDS, security group, SSM contract
+#   make db-bootstrap ENV=dev       # urban_rag role + grants + its password
 #   make db-init     ENV=dev        # postgis + pgvector + rag schema
 #
 #   # day to day:
@@ -99,17 +100,27 @@ output: ## Show ENV outputs
 # none of them break when the instance is replaced.
 # ---------------------------------------------------------------------------
 
+# A uv-created venv — which the dataplatform's is, and which is usually what is
+# active here — ships without pip, and a stock Ubuntu python3 has none either.
+# So reach for uv first and keep pip as the fallback.
 db-deps: ## Install what scripts/db.py needs (boto3, psycopg)
-	python3 -m pip install -r scripts/requirements.txt
+	@if command -v uv >/dev/null 2>&1; then \
+		uv pip install -r scripts/requirements.txt; \
+	elif python3 -m pip --version >/dev/null 2>&1; then \
+		python3 -m pip install -r scripts/requirements.txt; \
+	else \
+		echo "Need uv or pip. Install uv (https://docs.astral.sh/uv/) or apt install python3-pip."; \
+		exit 1; \
+	fi
 
-db-init: ## Apply sql/*.sql — extensions, rag.features, rag.lots, spatial search
+db-init: ## Apply sql/*.sql — roles, extensions, rag.features, rag.lots, spatial search
 	$(DB) init
 
-# The role and grants live in the dataplatform, because that is the repo whose
-# code connects as that role. Run from here, where the master credentials are.
-DATAPLATFORM ?= ../hbu_dataplatform
+# sql/000_roles.sql is applied by db-init too, since it sorts first. What only
+# this target does is the credential no .sql file carries: generate the role's
+# password, set it, and write it to the secret Terraform created for it.
 db-bootstrap: ## Create the urban_rag role + grants, storing its password in Secrets Manager
-	$(DB) bootstrap --file $(DATAPLATFORM)/sql/pgvector_bootstrap.sql --store-password
+	$(DB) bootstrap --store-password
 
 db-ca: ## Download the RDS root certificate that sslmode=verify-full needs
 	$(DB) ca

@@ -21,7 +21,7 @@ resource "aws_security_group" "bastion" {
   count = var.enable_bastion ? 1 : 0
 
   name        = "${local.prefix}-bastion-sg"
-  description = "SSM bastion — egress only; Session Manager needs no inbound rule"
+  description = "SSM bastion - egress only; Session Manager needs no inbound rule"
   vpc_id      = data.terraform_remote_state.shared.outputs.vpc_id
 
   tags = { Name = "${local.prefix}-bastion-sg" }

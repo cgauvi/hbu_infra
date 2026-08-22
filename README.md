@@ -39,9 +39,11 @@ Internet
 │                                                        │
 │  public  ─ RDS PostgreSQL 16                          │
 │            postgis · pgvector · pg_trgm               │
-│            rag.chunks    ← hbu_dataplatform           │
-│            rag.features  ← this repo                  │
-│            rag.lots      ← this repo                  │
+│            rag.chunks        ← hbu_dataplatform       │
+│            rag.features      ← this repo              │
+│            rag.lots          ← this repo              │
+│            rag.buildings     ← this repo              │
+│            rag.building_lots ← this repo              │
 │                                                        │
 │  private ─ (empty; for ECS, when there is an app)     │
 └──────────────────────────────────────────────────────┘
@@ -66,18 +68,22 @@ What this repo owns is everything that table cannot create for itself:
 
 | Object | Why it is here |
 |---|---|
+| `urban_rag`, `urban_rag_ro`, schema `rag` | Creating a role and a schema it owns needs the master user, and the master credentials are resolved here |
 | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements` | `CREATE EXTENSION` needs `rds_superuser`, which the pipeline's role must not have |
-| `rag.features`, `rag.lots` | The geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
+| `rag.features`, `rag.lots`, `rag.buildings` | The geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
+| `rag.building_lots` | Which buildings sit on which lots, computed with `ST_Intersection` — a building spanning several lots gets one row per lot, holding just the clipped slice and its share of the footprint. Populated by `hbu_dataplatform` (`urban_rag.postgis`), from that borough's latest `rag.buildings`/`rag.lots` rows |
 | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot` | The joins from geometry to vectors |
 
-The `urban_rag` login role, the `rag` schema, and the grants come from the
-dataplatform's own `sql/pgvector_bootstrap.sql` — it lives there because that
-is the repo whose code connects as that role. `make db-bootstrap` runs it from
-here, where the master credentials are.
+The role, the schema and the grants are [`sql/000_roles.sql`](sql/000_roles.sql).
+It sorts first, so `db-init` applies it ahead of everything else; `db-bootstrap`
+applies it too and then sets the role's password, which is the one thing no
+`.sql` file here carries. It used to live in hbu_dataplatform, which meant a
+cross-repo `--file` path and two half-bootstraps that each assumed the other
+had granted what it needed.
 
-Everything in `rag` ends up owned by `urban_rag` whichever order the two
-bootstrap steps run in: [`sql/002_spatial.sql`](sql/002_spatial.sql) hands over
-ownership if the role exists and emits a `NOTICE` if it does not.
+Everything in `rag` ends up owned by `urban_rag` whichever order the steps run
+in: [`sql/002_spatial.sql`](sql/002_spatial.sql) hands over ownership if the
+role exists and emits a `NOTICE` if it does not.
 
 ---
 
@@ -114,13 +120,14 @@ allowlisted automatically — re-apply after your ISP hands you a new one.
 
 ### 4. Bootstrap the database
 
-Order matters only in that `db-bootstrap` creates the role that `db-init` hands
-ownership to. Running `db-init` first is fine; re-run it afterwards.
+Both steps apply `000_roles.sql`, so the order does not affect who owns what.
+What only `db-bootstrap` does is set the role's password: until it has run,
+`urban_rag` exists but cannot log in.
 
 ```bash
 make db-ca                    # RDS root cert, for sslmode=verify-full
 make db-bootstrap ENV=dev     # urban_rag role + grants, password → Secrets Manager
-make db-init      ENV=dev     # extensions, rag.features, rag.lots
+make db-init      ENV=dev     # extensions, rag.features, rag.lots, rag.buildings, rag.building_lots
 make db-check     ENV=dev
 ```
 
@@ -267,7 +274,7 @@ defaults to medium for that reason.
 | [`ssm.tf`](ssm.tf) | The `/hbu-<env>/db/*` contract, the app-role secret, the IAM policy for readers |
 | [`bastion.tf`](bastion.tf) | Optional SSM jump host (`enable_bastion`) |
 | [`schedule.tf`](schedule.tf) | Optional overnight stop/start (`enable_scheduled_shutdown`) |
-| [`sql/`](sql/) | Extensions, spatial tables, spatial search functions |
+| [`sql/`](sql/) | Extensions, spatial tables, the building x lot join, spatial search functions |
 | [`scripts/db.py`](scripts/db.py) | The CLI everything above is driven through |
 | [`scripts/tunnel.sh`](scripts/tunnel.sh) | Session Manager port forwarding |
 
