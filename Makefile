@@ -17,9 +17,20 @@ ENV        ?= dev
 AWS_REGION ?= us-east-1
 PROJECT    ?= hbu
 
+# The stack lives in account 038083667790. The default profile is a different
+# account entirely, where none of these resources exist — and because BUCKET is
+# derived below rather than committed, running under it does not fail loudly, it
+# just points every target at a bucket and a parameter namespace that are not
+# there. Pinned and exported so terraform, the aws CLI, and scripts/db.py all
+# resolve the same account. Override on the command line if that ever changes.
+AWS_PROFILE ?= charles_gauvin_east_1
+export AWS_PROFILE
+
 # Derived from whichever credentials are active, so the backend never has to be
 # committed and switching AWS_PROFILE switches accounts cleanly.
-ACCOUNT_ID = $(shell aws sts get-caller-identity --query Account --output text)
+# `export` above reaches recipes but not $(shell), so name the profile inline
+# here too — otherwise BUCKET silently resolves against the default account.
+ACCOUNT_ID = $(shell AWS_PROFILE=$(AWS_PROFILE) aws sts get-caller-identity --query Account --output text)
 BUCKET     = $(PROJECT)-tf-state-$(ACCOUNT_ID)
 LOCK_TABLE = $(PROJECT)-tf-locks
 

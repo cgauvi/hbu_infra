@@ -90,9 +90,14 @@ role exists and emits a `NOTICE` if it does not.
 ## First-time setup
 
 ```bash
-export AWS_PROFILE=charles_gauvin_east_1
 make db-deps           # boto3 + psycopg for scripts/db.py
 ```
+
+`AWS_PROFILE` no longer needs exporting — the Makefile pins it to
+`charles_gauvin_east_1` (account `038083667790`, where this stack lives) and
+exports it to every target. Pass `AWS_PROFILE=<other> make ...` to override.
+Note that `make db-deps` installs into whichever virtualenv is active, since
+`uv pip install` targets `$VIRTUAL_ENV`.
 
 ### 1. State backend (once per account)
 
