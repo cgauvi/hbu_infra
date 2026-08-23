@@ -244,6 +244,25 @@ AWS_PROFILE=charles_gauvin_east_1 aws secretsmanager get-secret-value \
 --output text
 ```
 
+### QGIS credentials
+
+After
+
+```
+make db-tunnel ENV=dev    
+```
+
+and fetching the password using the procedure above, fill in the following values in the postgres connection to access the DB on QGIS:
+
+```
+Host: 127.0.0.1
+Port: 5433
+Database: urban_rag
+SSL mode: require
+Username: hbu_admin
+Password: <actual password from Secrets Manager>
+```
+
 ---
 
 ## Spatial retrieval
