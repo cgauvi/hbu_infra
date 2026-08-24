@@ -5,7 +5,7 @@
 #   make apply-shared               # VPC, subnets, DB subnet groups
 #   make apply       ENV=dev        # RDS, security group, SSM contract
 #   make db-bootstrap ENV=dev       # urban_rag role + grants + its password
-#   make db-init     ENV=dev        # postgis + pgvector + rag schema
+#   make db-init     ENV=dev        # postgis + pgvector + rag/dagster schemas
 #
 #   # day to day:
 #   make db-shell    ENV=dev        # interactive SQL

@@ -1,10 +1,10 @@
 -- Extensions. Run once per database, as the RDS master user — the role RDS
 -- gives rds_superuser, which is what CREATE EXTENSION requires here.
 --
--- The `urban_rag` login role, the `rag` schema it owns, and the grants live in
--- 000_roles.sql, which sorts before this file and has therefore already run by
--- the time this one does. `vector` is created here rather than there because
--- extensions are one thing and roles are another.
+-- The `urban_rag` login role, the `rag`/`dagster` schemas it owns, and the
+-- grants live in 000_roles.sql, which sorts before this file and has therefore
+-- already run by the time this one does. `vector` is created here rather than
+-- there because extensions are one thing and roles are another.
 --
 -- IF NOT EXISTS throughout, so this is safe to re-run: db.py applies every
 -- file in sql/ in name order on each `db-init`.
@@ -15,9 +15,9 @@
 -- here". Neither question is useful on its own.
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- Vector type, distance operators, and HNSW. Also created by the
--- dataplatform's bootstrap; created here too so a database is usable before
--- that file has ever been run, and harmless when it has.
+-- Vector type, distance operators, and HNSW. Kept here with the other
+-- privileged database setup; the dataplatform creates only its own tables and
+-- indexes once the extension exists.
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Trigram similarity — the lexical half of hybrid retrieval, and what lets an

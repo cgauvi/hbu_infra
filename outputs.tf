@@ -85,8 +85,8 @@ output "next_steps" {
   description = "What to run once the instance is available"
   value       = <<-EOT
     make db-ca                             # RDS root cert, for sslmode=verify-full
-    make db-init      ENV=${var.environment}   # postgis, pg_trgm, rag.features, rag.lots
     make db-bootstrap ENV=${var.environment}   # the ${var.app_db_username} role + grants
+    make db-init      ENV=${var.environment}   # extensions, rag/dagster schemas, spatial tables
     make db-check     ENV=${var.environment}   # confirm what is installed
 
     Then, in hbu_dataplatform, materialize document_index to create and fill

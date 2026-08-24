@@ -168,7 +168,7 @@ variable "schedule_timezone" {
 # ---------------------------------------------------------------------------
 
 variable "app_db_username" {
-  description = "Login role the pipeline and the query side connect as — created by sql/000_roles.sql, which expects this exact name. It owns the `rag` schema and nothing else; the master user is only for bootstrap and migrations."
+  description = "Login role the pipeline and the query side connect as — created by sql/000_roles.sql, which expects this exact name. It owns the `rag` corpus/spatial schema and the `dagster` metadata schema; the master user is only for bootstrap and migrations."
   type        = string
   default     = "urban_rag"
 }

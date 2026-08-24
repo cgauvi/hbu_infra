@@ -24,8 +24,8 @@ BEGIN;
 -- 1. The roles
 --
 -- `urban_rag` is what the pipeline and the query side connect as; it owns the
--- `rag` schema and nothing else. `urban_rag_ro` is the read-only half, for
--- anything that reads the corpus without loading it.
+-- `rag` schema plus Dagster's metadata schema. `urban_rag_ro` is the read-only
+-- half, for anything that reads the corpus without loading it.
 -- ---------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -68,6 +68,10 @@ $$;
 -- create in `rag` is handed to the same owner at the end of each file.
 -- ---------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS rag AUTHORIZATION urban_rag;
+CREATE SCHEMA IF NOT EXISTS dagster AUTHORIZATION urban_rag;
+
+ALTER SCHEMA dagster OWNER TO urban_rag;
+REVOKE ALL ON SCHEMA dagster FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA rag TO urban_rag_ro;
 -- Most of the tables do not exist yet, so the grant is on what gets created

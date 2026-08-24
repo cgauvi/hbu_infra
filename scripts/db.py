@@ -409,11 +409,12 @@ ROLES_FILE = "000_roles.sql"
 def cmd_bootstrap(args) -> int:
     """Create the app roles, then give the pipeline's role its password.
 
-    `sql/000_roles.sql` creates the `urban_rag` login role, the `rag` schema it
-    owns and the grants — the things the pipeline's own role is deliberately
-    not privileged enough to create for itself. `init` applies that file too,
-    in name order, so what is only ever done here is the credential: generate a
-    password, set it, and put it where the pipeline reads it from.
+    `sql/000_roles.sql` creates the `urban_rag` login role, the `rag` and
+    `dagster` schemas it owns and the grants — the things the pipeline's own
+    role is deliberately not privileged enough to create for itself. `init`
+    applies that file too, in name order, so what is only ever done here is the
+    credential: generate a password, set it, and put it where the pipeline
+    reads it from.
     """
     import secrets as secrets_module
 
@@ -520,6 +521,27 @@ def cmd_check(args) -> int:
             """,
         )
         print(_table(cols, rows) if rows else f"  {DIM}empty — run `db.py init`{RESET}")
+
+        print(f"\n{BOLD}dagster schema{RESET}")
+        cols, rows = _run(
+            conn,
+            """
+            SELECT c.relname AS object,
+                   CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ELSE c.relkind::text END AS kind,
+                   COALESCE(s.n_live_tup, 0) AS rows,
+                   pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+             WHERE n.nspname = 'dagster' AND c.relkind IN ('r', 'v', 'i', 'S')
+             ORDER BY c.relkind, c.relname
+            """,
+        )
+        print(
+            _table(cols, rows)
+            if rows
+            else f"  {DIM}empty - first Dagster start creates its tables{RESET}"
+        )
 
         # rag.chunks and rag.corpus_status are created by the dataplatform's
         # first load, not by this repo, so their absence is a stage of setup
