@@ -29,3 +29,30 @@ enable_bastion            = false
 # subnet groups inside a single VPC -- and the plan will claim otherwise unless
 # you pass -replace=aws_db_instance.main. On prod that means a snapshot restore
 # rather than the empty rebuild dev got. See "Reachability" in the README.
+
+# ---------------------------------------------------------------------------
+# The web application
+#
+# Off until the same first-run sequence has happened against prod: push an
+# image, set both secrets, then flip this on. Unlike dev, prod pins an
+# immutable tag — `latest` moving under a running service is convenient in dev
+# and is exactly what you do not want here.
+# ---------------------------------------------------------------------------
+enable_app    = false
+app_image_tag = "latest"
+
+app_desired_count = 1
+app_cpu           = "512"
+app_memory        = "1024"
+
+# A shared password over plain HTTP is not a prod posture. Put an ACM
+# certificate here before opening this to anything.
+app_ingress_cidr_blocks = ["0.0.0.0/0"]
+app_certificate_arn     = ""
+
+app_env_mode            = "prod"
+app_log_retention_days  = 30
+app_deletion_protection = true
+
+# A shell inside the task role, on the environment holding real data. Off.
+app_enable_execute_command = false

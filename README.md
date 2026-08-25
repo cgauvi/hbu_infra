@@ -1,13 +1,20 @@
 # hbu_infra
 
-Terraform for the **hbu** RAG database: Amazon RDS for PostgreSQL with
-**PostGIS** and **pgvector**, plus a single CLI for talking to it.
+Terraform for **hbu**: a RAG database — Amazon RDS for PostgreSQL with
+**PostGIS** and **pgvector** — the CLI that talks to it, and the Streamlit
+front end that reads it, on Fargate behind a load balancer.
 
 The corpus and the geometry live in one database on purpose. `hbu_dataplatform`
 scrapes Montreal's zoning layers and embeds the PDFs they link to; a
 highest-and-best-use question needs both halves at once — *what do the rules
 say* is a vector search, *which rules apply here* is a spatial one, and neither
 answer is worth much alone.
+
+The front end lives in the same stack for a related reason. The registry it is
+pulled from, the cluster it runs on, the secrets it reads and the security group
+that lets it reach 5432 are all things this stack's networking and IAM already
+describe — splitting them out would mean publishing half of them as outputs and
+consuming them back.
 
 There is no CI yet. Every apply is manual, and the state backend is the only
 thing bootstrapped ahead of it.
@@ -22,44 +29,65 @@ Three stacks, each with its own state, following the same split as
 | Stack | State key | Owns |
 |---|---|---|
 | [`bootstrap/`](bootstrap/) | *local* | The S3 state bucket and DynamoDB lock table. Applied once. |
-| [`shared/`](shared/) | `hbu/shared/terraform.tfstate` | VPC, public + private subnets, IGW, route tables, both DB subnet groups. |
-| *(root)* | `hbu/<env>/terraform.tfstate` | The RDS instance, its security group, the SSM connection contract, IAM, and the optional bastion and stop/start schedules. |
+| [`shared/`](shared/) | `hbu/shared/terraform.tfstate` | VPC, public + private subnets, IGW, route tables, both DB subnet groups, and the ECR repository the application image lives in. |
+| *(root)* | `hbu/<env>/terraform.tfstate` | The RDS instance, its security group, the SSM connection contract, IAM, the ALB and Fargate service running the front end, its two secrets, and the optional bastion and stop/start schedules. |
 
 The per-env stack reads the shared stack's outputs through
-`data "terraform_remote_state"`, so it can place a database into networking it
-does not own — and `dev` and `prod` differ only by their `.tfvars` and their
-state key.
+`data "terraform_remote_state"`, so it can place a database and a service into
+networking it does not own — and `dev` and `prod` differ only by their `.tfvars`
+and their state key.
 
 ```
-Laptop
-    │  aws ssm start-session — IAM, no open port, no VPN
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  Shared VPC (10.20.0.0/16)                              │
-│                                                         │
-│  public  ─ SSM bastion (t4g.nano; egress only, no key)  │
-│                 │                                       │
-│                 │ :5432, its security group to the      │
-│                 ▼ database's — no CIDR anywhere         │
-│  private ─ RDS PostgreSQL 16 — no public endpoint       │
-│            postgis · pgvector · pg_trgm                 │
-│            rag.chunks        ← hbu_dataplatform         │
-│            rag.features      ← this repo                │
-│            rag.lots          ← this repo                │
-│            rag.buildings     ← this repo                │
-│            rag.building_lots ← this repo                │
-└─────────────────────────────────────────────────────────┘
+              Laptop                        Internet
+                 │                              │
+                 │ aws ssm start-session        │ :443 — :80 answers a 301
+                 │ IAM, no open port, no VPN    │
+                 ▼                              ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  Shared VPC (10.20.0.0/16)                                             │
+│                                                                        │
+│  public   SSM bastion (t4g.nano)        ALB ──┐                        │
+│           egress only, no key                 │                        │
+│                │                              │ :8501, by security     │
+│                │                              ▼ group                  │
+│  public                                 Fargate task (Streamlit)       │
+│                │                              │      egress to ECR,    │
+│                │ :5432, by security group     │      Secrets Manager,  │
+│                └──────────────┬───────────────┘      HuggingFace       │
+│                               ▼                                        │
+│  private  RDS PostgreSQL 16 — no public endpoint                       │
+│           postgis · pgvector · pg_trgm                                 │
+│           rag.chunks        ← hbu_dataplatform                         │
+│           rag.features      ← this repo                                │
+│           rag.lots          ← this repo                                │
+│           rag.buildings     ← this repo                                │
+│           rag.building_lots ← this repo                                │
+│           rag.lot_features  ← this repo                                │
+│           rag.streets       ← this repo                                │
+│           rag.lot_frontage  ← this repo                                │
+│           rag.lot_profiles  ← this repo                                │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-That is `dev`. **`prod` is still the public posture** — a public endpoint
-locked to the applying machine's IP — because nothing but a laptop talks to it
-yet; see [Reachability](#reachability-and-the-tradeoff).
+Two things in that picture are the same decision twice. There is deliberately
+**no NAT gateway** — it would cost more per month than the database — so
+anything needing outbound internet has to sit in a public subnet with a public
+IP: the bastion, because its SSM agent dials out to Session Manager, and the
+Fargate task, because it pulls from ECR and calls the HuggingFace Inference API
+on every question. Neither accepts anything inbound except from a named
+security group, so "public subnet" is a routing fact rather than an exposure
+one. The longer version is in
+[Why the tasks sit in a public subnet](#why-the-tasks-sit-in-a-public-subnet).
 
-There is deliberately **no NAT gateway**: nothing in the private tier needs
-outbound internet, and a NAT would cost more per month than the database. The
-bastion sits in a public subnet with a public IP for the same reason — the SSM
-agent has to reach Session Manager outbound, and nothing can reach it inbound.
+The three hops inside the VPC are all **security-group references, not CIDRs** —
+the ALB to the task on 8501, the task to the database on 5432, the bastion to
+the database on 5432. A Fargate task's address is assigned at start and changes
+on every deploy, so a CIDR rule could not describe it in the first place.
 
+That is `dev`. **`prod` is still the public posture** — a public endpoint locked
+to the applying machine's IP, no bastion, and `enable_app = false` — because
+nothing but a laptop talks to it yet; see
+[Reachability](#reachability-and-the-tradeoff).
 ---
 
 ## Who owns which table
@@ -80,7 +108,12 @@ What this repo owns is everything that table cannot create for itself:
 | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements` | `CREATE EXTENSION` needs `rds_superuser`, which the pipeline's role must not have |
 | `rag.features`, `rag.lots`, `rag.buildings` | The geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
 | `rag.building_lots` | Which buildings sit on which lots, computed with `ST_Intersection` — a building spanning several lots gets one row per lot, holding just the clipped slice and its share of the footprint. Populated by `hbu_dataplatform` (`urban_rag.postgis`), from that borough's latest `rag.buildings`/`rag.lots` rows |
+| `rag.lot_features` | Which map features cover which lot — the same clip one layer over, and the hop that gives a lot its documents. A lot has no zoning id to link on: the cadastre is provincial (Infolot, `NO_LOT`) and the zoning is municipal (Spectrum, `NUMERO_COMPLET`), so the two are joined by geometry or not at all. Populated by `hbu_dataplatform` (`urban_rag.postgis`), which also fills `rag.features` |
+| `rag.streets` | The sides of the roadway, from Montreal's *géobase double* — one row per `COTE_RUE_ID`, already clipped to a borough by the pipeline. Lines, so `length_m` rather than `area_m2`. Populated by `hbu_dataplatform` (`urban_rag.postgis`) |
+| `rag.lot_frontage` | How much of each lot's boundary faces each street side, in metres. Measured on `ST_Boundary(lot)` against a buffered street, not on the lot itself — `ST_Length` of a polygon is 0. `frontage_rank = 1` is the street a lot mostly fronts on. Populated by `hbu_dataplatform` (`urban_rag.postgis`), from that borough's `rag.lots`/`rag.streets` rows |
+| `rag.lot_profiles` | Every lot in a borough at the grain a question is asked about — one row per parcel, carrying whether a building stands on it and how many, its primary and secondary street frontage, and the document that governs it. The three joins above each hold one row per (lot × something); this is where they collapse onto the lot. Replaces an earlier `rag.vacant_lots`, which kept only the parcels it found nothing on and so could answer one question at the cost of hiding every other lot — `WHERE NOT has_building` is that selection now. Populated by `hbu_dataplatform` (`urban_rag.postgis`) |
 | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot` | The joins from geometry to vectors |
+| `rag.lot_documents`, `rag.search_at_lot_number` | The same joins entered from a lot number rather than a point, off the precomputed `rag.lot_features` |
 
 The role, the schemas and the grants are [`sql/000_roles.sql`](sql/000_roles.sql).
 It sorts first, so `db-init` applies it ahead of everything else; `db-bootstrap`
@@ -125,28 +158,88 @@ fallback, because a uv-made venv has no pip. Every `db-*` target then runs
 `scripts/db.py` with that venv's interpreter, so no `python3` on PATH is
 required.
 
+### The whole thing, in order
+
+Database and front end are one sequence, not two: the shared stack creates the
+VPC *and* the image registry, and the app's secrets do not exist until the apply
+that creates the database has also created them.
+
+```bash
+make bootstrap                        # 1. state backend, once per account
+make plan-shared apply-shared         # 2. VPC + ECR, once
+make app-push     ENV=dev             # 3. an image for the service to start on
+make plan apply   ENV=dev             # 4. database, ALB, service, both secrets
+
+make db-tunnel    ENV=dev             # 5. another shell, left running
+make db-wait      ENV=dev TUNNEL=1
+make db-ca
+make db-bootstrap ENV=dev TUNNEL=1    #    roles, grants, the role's password
+make db-init      ENV=dev TUNNEL=1    #    extensions, schemas, spatial tables
+make db-check     ENV=dev TUNNEL=1
+
+make app-password ENV=dev             # 6. the two secrets, then roll to pick
+make app-hf-token ENV=dev             #    them up
+make app-deploy   ENV=dev
+make app-url      ENV=dev
+```
+
+Two of those positions are load-bearing rather than stylistic:
+
+- **`app-push` before the first `apply`.** `dev.tfvars` already has
+  `enable_app = true`, so that apply starts the service — and a service cannot
+  reach a steady state against a tag that is not in ECR yet. This is also why
+  `enable_app` *defaults* to `false`: it is the only value that makes a first
+  apply safe in an environment whose tfvars has not been thought about.
+- **`app-password` after it, not before.** Both secret targets resolve the ARN
+  from a Terraform output, and the secret does not exist until the apply that
+  creates it. In between, the app is up holding `PLACEHOLDER` in both: it
+  serves the login form and refuses every password, which
+  [`auth.py`](../hbu_rag_map/src/utils/auth.py) does deliberately and says so.
+
+Steps 5 and 6 are independent of each other. The app cannot answer a question
+until the database has been bootstrapped, but neither sequence waits on the
+other, and the tunnel in step 5 has nothing to do with the app.
+
 ### 1. State backend (once per account)
 
 ```bash
 make bootstrap         # local state; creates hbu-tf-state-<account> + hbu-tf-locks
 ```
 
-### 2. Shared VPC (once)
+### 2. Shared VPC and the image registry (once)
+
+One apply, two consumers: the networking every other stack places things into,
+and the ECR repository `make app-push` pushes to. It is the one step the
+database and the front end genuinely share.
 
 ```bash
 make plan-shared
 make apply-shared
 ```
 
-### 3. The database
+### 3. An image to start against
+
+Built from `../hbu_rag_map` and pushed to the repository step 2 created. It has
+to exist before the apply that turns the service on.
+
+```bash
+make app-push ENV=dev             # builds and pushes :latest
+```
+
+`dev` tracks the moving `:latest`; `prod` pins an immutable tag, because `latest`
+moving under a running service is convenient in one and exactly what you do not
+want in the other.
+
+### 4. The database, the load balancer and the service
 
 ```bash
 make plan  ENV=dev
 make apply ENV=dev
 ```
 
-`dev` comes up with no public endpoint, so everything after this goes through
-the tunnel: one shell holds it open, the rest of the work happens in another.
+`dev` comes up with no public endpoint, so everything database-side after this
+goes through the tunnel: one shell holds it open, the rest of the work happens
+in another.
 
 ```bash
 make db-tunnel ENV=dev            # leave running; Ctrl-C closes it
@@ -159,7 +252,7 @@ Every `db-*` target takes `TUNNEL=1`, which swaps the address for
 `prod` still sets `allow_current_ip = true`, which allowlists the applying
 machine's public address — re-apply there after your ISP hands you a new one.
 
-### 4. Bootstrap the database
+### 5. Bootstrap the database
 
 Both steps apply `000_roles.sql`, so the order does not affect who owns what.
 What only `db-bootstrap` does is set the role's password: until it has run,
@@ -176,6 +269,27 @@ make db-check     ENV=dev TUNNEL=1
 exist yet`. That is expected: those functions read the dataplatform's table.
 Materialize `document_index` over there, then run `make db-init` once more to
 create them.
+
+### 6. The front end's two secrets
+
+Step 4 created both holding `PLACEHOLDER`, and Terraform will never touch their
+contents again. These write the real values straight to Secrets Manager:
+
+```bash
+make app-password ENV=dev         # the shared access password (prompts)
+make app-hf-token ENV=dev         # the Inference API token (prompts)
+make app-deploy   ENV=dev         # tasks read secrets at start, so roll them
+make app-url      ENV=dev         # where it ended up
+make app-dns      ENV=dev         # the record to point a domain at it
+```
+
+Why they are shaped that way, and what the password does and does not protect,
+is in [The web application](#the-web-application) below.
+
+Afterwards a code change is two commands — `make app-push app-deploy ENV=dev`.
+`app-deploy` forces a new deployment of the *same* task definition, which is
+what picks up a moved `latest`. A change to the task itself — CPU, memory, a
+new environment variable — is a `terraform apply`, not `app-deploy`.
 
 ---
 
@@ -230,7 +344,6 @@ apply from reverting it to the placeholder. IAM authentication is enabled on
 the instance as an alternative, for the path where nothing stores a password at
 all — the role still needs `GRANT rds_iam`, which is commented out in
 [`sql/000_roles.sql`](sql/000_roles.sql).
-
 
 ### Getting the DB credentials
 
@@ -351,6 +464,160 @@ state once ECS is talking to it, and a confusing one before.
 
 ---
 
+## The web application
+
+`hbu_rag_map` is packaged as a container and runs on Fargate behind the load
+balancer in the diagram above. Standing it up for the first time is steps 3, 4
+and 6 of [First-time setup](#first-time-setup); this section is the *why* behind
+the parts of that sequence that otherwise look arbitrary.
+
+### Why the tasks sit in a public subnet
+
+Every chat turn and every query embedding is an outbound HTTPS call to the
+HuggingFace Inference API, and the image is pulled from ECR over the internet.
+With no NAT gateway in this VPC, a task in the private tier can do neither.
+
+The alternatives were both worse here. A NAT gateway is ~$32/mo before data
+processing — more than the database it would sit beside. Interface endpoints
+for ECR, S3, logs and Secrets Manager are cheaper than that but solve only the
+pull: nothing reaches `huggingface.co` through them, so the app would start and
+then fail on its first question.
+
+"Public subnet" is a routing fact, not an exposure one. The task security group
+accepts inbound **only** from the ALB's security group, so the public IP
+carries egress and answers nothing.
+
+### HTTPS, and pointing a domain at it
+
+`app_certificate_arn` is the whole switch. Empty, the ALB is a single port 80
+listener. Set to an ACM certificate **in the same region as the load balancer**,
+it adds a 443 listener on `ELBSecurityPolicy-TLS13-1-2-2021-06` and turns 80
+into a 301 to it — in place, without replacing the load balancer or changing
+its DNS name, so it is safe to flip on a running service.
+
+`dev` is set, to a certificate in `us-east-1`. `prod` is still empty, which
+costs nothing while `enable_app = false` and is the first thing to fix when
+that flips.
+
+TLS ends at the listener. The ALB talks to the task over plain HTTP inside the
+VPC, which is the normal arrangement and is why the target group is `HTTP` on
+8501 — the hop is between two security groups in one VPC, and terminating
+twice would mean managing a certificate the tasks would have to carry.
+
+The certificate is why the load balancer now needs a **name**. A public CA
+cannot issue for `*.elb.amazonaws.com`, so opening the ALB's own DNS name over
+HTTPS warns however valid the certificate is. Point a name the certificate
+covers at it instead:
+
+```bash
+make app-dns ENV=dev              # the record, spelled out
+terraform output -raw app_dns_target    # just the hostname
+```
+
+An ALB has no fixed address — AWS moves it between IPs as it scales — so this
+is never an A record holding an IP. Two shapes, depending on where the zone
+lives:
+
+| Zone | Record |
+|---|---|
+| Anywhere (Cloudflare, Namecheap, a registrar) | `CNAME app.example.com → app_dns_target`. A CNAME cannot sit at a zone apex, so this has to be a subdomain. |
+| Route 53 | An alias `A` record — free, and it works at the apex. Needs `app_dns_target` as the alias name and `app_dns_zone_id` as its zone, which is the **ALB's** hosted zone, not your domain's. |
+
+Terraform does not own the record. The zone is not in this stack and may not be
+in this account, so the mapping is a manual step and the outputs exist to make
+it a copy-paste one.
+
+Two things that look like breakage and are not. A certificate covering
+`app.example.com` does not cover `example.com` or any other subdomain unless it
+was requested with those names — ACM does not infer them. And a certificate is
+only usable in the region it was issued in: `us-east-1` is special for
+CloudFront, not for load balancers — this one works because the ALB is in
+`us-east-1` too.
+
+### The password, and what it is not
+
+The app asks for one shared password before it renders anything — checked in
+[`src/utils/auth.py`](../hbu_rag_map/src/utils/auth.py), not at the load
+balancer, because an ALB cannot do basic auth and Cognito would be a user
+directory for a thing that has one credential.
+
+It now travels over TLS: with `app_certificate_arn` set there is no plain-HTTP
+path to the form, because port 80 redirects before the page is ever served.
+That closes the transport problem and none of the others:
+
+- **It authenticates access, not people.** Nothing records who asked a
+  question, and revoking one person's access means changing the password for
+  everyone.
+- **A redirect is not a guarantee the first request was private.** Someone who
+  types `http://` sends that one request in the clear before the 301 — it
+  carries no password, but it does carry the URL. HSTS would fix it and is not
+  set.
+- **It is only as good as where it is kept.** One password shared by hand is
+  one password in someone's notes; `make app-password` is cheap, so change it
+  when the set of people changes.
+
+A `check` block in [`alb.tf`](alb.tf) warns on every plan where the app is open
+to `0.0.0.0/0` with no certificate — a warning rather than an error, because
+HTTP-only behind a narrow `app_ingress_cidr_blocks` is a reasonable place to
+start. `dev` now satisfies it by having the certificate rather than by
+narrowing the CIDR.
+
+### The two application secrets
+
+Both the password and the HuggingFace token follow the pattern
+[`ssm.tf`](ssm.tf) established for the app-role password: **Terraform owns the
+secret, not the value.** It creates the container, writes `PLACEHOLDER` once,
+and then `ignore_changes` keeps it from ever reading or rewriting the contents.
+
+```bash
+make app-password ENV=dev     # the shared access password
+make app-hf-token ENV=dev     # HuggingFace Inference API token
+```
+
+Both prompt, and write straight to Secrets Manager. Nothing about them passes
+through a plan, appears in a diff, or lands in the state file in S3 — which is
+the same reason the database's master password is `manage_master_user_password`
+rather than a Terraform-generated string.
+
+Two consequences worth knowing:
+
+- **A rotation is not live until the service rolls.** A task reads both secrets
+  at start, so `make app-password` changes nothing for anyone already running.
+  Follow it with `make app-deploy ENV=dev`.
+- **A first apply creates a working service with a placeholder password.** The
+  app will start and refuse every login until the real value is set, which is
+  why both secret commands come before `make apply` in the sequence above.
+
+The task reads them by ARN through the execution role, injected as environment
+variables by ECS at start — `ecs.tf` names the secret, never its value. The
+ARNs are outputs (`app_password_secret_arn`, `app_hf_token_secret_arn`) if you
+need to set one from the console instead.
+
+### The task gets no configuration
+
+The image carries no endpoint, no password, and no environment name. The task
+definition sets `HBU_PROJECT` and `HBU_ENV` — the two halves of the SSM prefix
+— and `src/utils/db.py` discovers the host, port, database and app-role secret
+underneath it. Replacing the RDS instance therefore changes nothing in
+[`ecs.tf`](ecs.tf) and needs no redeploy.
+
+It connects with `sslmode=verify-full`, which the image supports because its
+Dockerfile bakes in Amazon's RDS root bundle. The alternative, `require`,
+encrypts but authenticates nothing — it accepts any certificate presented.
+
+### Operating it
+
+```bash
+make app-status ENV=dev            # running/desired, last deployment events
+make app-logs   ENV=dev            # tail stdout (SINCE=1h to go further back)
+make app-shell  ENV=dev            # a shell inside the running task, over SSM
+make app-url    ENV=dev            # the URL, scheme following the certificate
+make app-dns    ENV=dev            # the DNS record to point a domain at it
+make app-scale  ENV=dev COUNT=0    # stop paying for it without destroying it
+```
+
+---
+
 ## Cost
 
 Roughly, in `us-east-1`, for the dev defaults:
@@ -361,6 +628,18 @@ Roughly, in `us-east-1`, for the dev defaults:
 | 20 GiB gp3 | ~$2/mo |
 | Backups (1 day, dev) | pennies |
 | Bastion t4g.nano + its public IPv4 (on for `dev`) | ~$7/mo |
+| ALB, idle (on for `dev` via `enable_app`) | ~$17/mo |
+| One Fargate task, 0.5 vCPU / 1 GiB, always on | ~$18/mo |
+| The task's public IPv4 | ~$4/mo |
+| ECR storage, 10 images | pennies |
+| ACM certificate, public | free |
+
+The application roughly triples the bill, and the ALB is most of it — it is
+billed by the hour whether or not anyone opens the page. `make app-scale
+ENV=dev COUNT=0` stops the Fargate and IPv4 charges without destroying
+anything; the ALB keeps billing until `enable_app = false` is applied, which
+also releases its DNS name — and with it any CNAME or alias record pointing at
+the old one, which has to be repointed after the next `enable_app = true`.
 
 `enable_scheduled_shutdown = true` adds EventBridge schedules that stop the
 instance overnight and start it in the morning, through the RDS API directly —
@@ -388,7 +667,10 @@ defaults to medium for that reason.
 | [`ssm.tf`](ssm.tf) | The `/hbu-<env>/db/*` contract, the app-role secret, the IAM policy for readers |
 | [`bastion.tf`](bastion.tf) | Optional SSM jump host (`enable_bastion`) |
 | [`schedule.tf`](schedule.tf) | Optional overnight stop/start (`enable_scheduled_shutdown`) |
-| [`sql/`](sql/) | Extensions, spatial tables, the building x lot join, spatial search functions |
+| [`alb.tf`](alb.tf) | The public load balancer, its security group, target group, and the 80/443 listeners `app_certificate_arn` switches between (`enable_app`) |
+| [`ecs.tf`](ecs.tf) | The Fargate cluster, task definition, service, task IAM roles, and the two application secrets |
+| [`outputs.tf`](outputs.tf) | Connection details, the app URL, and the ALB's DNS name and zone for a CNAME or alias record |
+| [`sql/`](sql/) | Extensions, spatial tables, the building x lot and lot x street joins, spatial search functions |
 | [`scripts/db.py`](scripts/db.py) | The CLI everything above is driven through |
 | [`scripts/tunnel.sh`](scripts/tunnel.sh) | Session Manager port forwarding |
 

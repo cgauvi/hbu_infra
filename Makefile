@@ -2,16 +2,27 @@
 #
 #   # one-time, in order:
 #   make bootstrap                  # state bucket + lock table (local state)
-#   make apply-shared               # VPC, subnets, DB subnet groups
+#   make apply-shared               # VPC, subnets, DB subnet groups, ECR repo
 #   make apply       ENV=dev        # RDS, security group, SSM contract
 #   make db-bootstrap ENV=dev       # urban_rag role + grants + its password
 #   make db-init     ENV=dev        # postgis + pgvector + rag/dagster schemas
+#
+#   # then the web app, in this order — the service cannot start against a
+#   # tag that is not in ECR yet:
+#   make app-push     ENV=dev       # build ../hbu_rag_map, push :latest
+#   make app-password ENV=dev       # the shared password people log in with
+#   make app-hf-token ENV=dev       # the Inference API token
+#   make plan apply   ENV=dev       # with enable_app = true in dev.tfvars
+#   make app-url      ENV=dev       # where it ended up
+#   make app-dns      ENV=dev       # the record to point a domain at it
 #
 #   # day to day:
 #   make db-shell    ENV=dev        # interactive SQL
 #   make db-check    ENV=dev        # what is installed and loaded
 #   make db-url      ENV=dev        # connection URL for anything else
 #   make plan        ENV=dev
+#   make app-push app-deploy ENV=dev  # ship a code change
+#   make app-logs    ENV=dev        # tail the container
 
 ENV        ?= dev
 AWS_REGION ?= us-east-1
@@ -96,7 +107,17 @@ TF_BACKEND_SHARED = -backend-config="bucket=$(BUCKET)" \
                     -backend-config="dynamodb_table=$(LOCK_TABLE)" \
                     -backend-config="encrypt=true"
 
-TF_VARS = -var-file="$(ENV).tfvars"
+# The address var.allow_current_ip lets through. One curl instead of the
+# hashicorp/http provider, which a TLS-inspecting proxy blocks outright —
+# Zscaler answers releases.hashicorp.com/terraform-provider-http with a block
+# page, and `terraform init` then fails for every environment, including the
+# ones that have this feature turned off. Recursive `=`, not `:=`, so the
+# lookup happens only in the recipes that expand TF_VARS. An empty result is
+# not fatal here: it only matters when allow_current_ip is on, and the
+# precondition in security.tf reports that in terms of the config.
+CURRENT_IP = $(shell curl -sS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')
+
+TF_VARS = -var-file="$(ENV).tfvars" -var="current_ip=$(CURRENT_IP)"
 
 # With no public endpoint there is no route from a laptop to the instance, so
 # every db-* target can be pointed at an open `make db-tunnel` session instead:
@@ -154,7 +175,9 @@ DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tu
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
         db-deps uv-check db-init db-check db-shell db-url db-env db-query db-wait \
-        db-start db-stop db-tunnel
+        db-start db-stop db-tunnel \
+        app-login app-build app-push app-deploy app-status app-wait app-logs \
+        app-url app-dns app-shell app-scale app-password app-hf-token
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -165,6 +188,8 @@ bootstrap init-shared plan-shared apply-shared destroy-shared \
 init plan apply destroy validate output: | aws-check
 db-init db-bootstrap db-ca db-check db-shell db-url db-env db-app-env \
 db-query db-wait db-start db-stop db-tunnel: | aws-check
+app-login app-build app-push app-deploy app-status app-wait app-logs \
+app-url app-dns app-shell app-scale app-password app-hf-token: | aws-check
 
 # Every target that talks to AWS goes through here first. Without it the wrong
 # credentials are invisible: BUCKET and the /$(PROJECT)-$(ENV) parameter
@@ -322,3 +347,149 @@ db-stop: ## Stop the instance
 # localhost:$(LOCAL_PORT) for as long as the session is open.
 db-tunnel: ## Port-forward through the SSM bastion to localhost:$(LOCAL_PORT)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)
+
+# How far back `make app-logs` starts. Overridable: SINCE=1h.
+SINCE ?= 10m
+
+# ---------------------------------------------------------------------------
+# The web application
+#
+# Build here, run on Fargate. Every target below resolves the registry, the
+# cluster, and the service from Terraform outputs at call time, so none of
+# them take an account number, a repository URL, or a task ARN — and none of
+# them break when the service is replaced.
+#
+#   make apply-shared             # once: creates the ECR repository
+#   make app-push     ENV=dev     # build the image and push it
+#   make app-password ENV=dev     # the shared password people log in with
+#   make app-hf-token ENV=dev     # the Inference API token
+#   make plan apply   ENV=dev     # with enable_app = true in dev.tfvars
+#   make app-url      ENV=dev     # where it ended up
+#   make app-dns      ENV=dev     # the record to point a domain at it
+#
+# Afterwards a code change is two commands: app-push, then app-deploy.
+# ---------------------------------------------------------------------------
+
+# Where the application source lives, relative to this file. Sibling checkout
+# by default; override if it sits somewhere else.
+APP_DIR ?= ../hbu_rag_map
+
+# The tag pushed and deployed. `latest` is what dev.tfvars pins the service to,
+# so moving it and forcing a deployment is the whole update path. Override with
+# a git sha for anything that has to be reproducible:
+#   make app-push ENV=prod APP_TAG=$(git -C ../hbu_rag_map rev-parse --short HEAD)
+APP_TAG ?= latest
+
+# X86_64 in the task definition means linux/amd64 here. They have to agree:
+# Fargate refuses a task whose image architecture does not match its
+# runtime_platform, and the error names neither side.
+APP_PLATFORM ?= linux/amd64
+
+# Read from the *shared* stack, not the per-env one — the repository is shared.
+# Resolved lazily (`=`, not `:=`) so the shell only runs for targets that use
+# it, and so it does not fail this file's parse when terraform is not inited.
+ECR_URL  = $(shell $(TF_SHARED) output -raw ecr_repository_url 2>/dev/null)
+ECR_HOST = $(firstword $(subst /, ,$(ECR_URL)))
+
+TF_OUT = $(TF) output -raw
+
+app-login: ## Log docker in to the shared ECR registry
+	@u="$(ECR_URL)"; \
+	[ -n "$$u" ] || { echo "no ecr_repository_url output — run \`make apply-shared\` first" >&2; exit 1; }; \
+	aws ecr get-login-password --region $(AWS_REGION) \
+	  | docker login --username AWS --password-stdin "$(ECR_HOST)"
+
+app-build: ## Build the runtime image from $(APP_DIR)
+	@u="$(ECR_URL)"; \
+	[ -n "$$u" ] || { echo "no ecr_repository_url output — run \`make apply-shared\` first" >&2; exit 1; }; \
+	docker build --target runtime --platform $(APP_PLATFORM) \
+	  --build-arg BUILD_VERSION=$(APP_TAG) \
+	  -t "$$u:$(APP_TAG)" $(APP_DIR)
+
+app-push: app-login app-build ## Build and push the image to ECR
+	@docker push "$(ECR_URL):$(APP_TAG)"
+
+# Forces a new deployment of the *same* task definition, which is what picks up
+# a moved `latest`. A changed task definition — new CPU, new secret, new env —
+# is a terraform apply, not this.
+app-deploy: ## Roll the service onto the image currently tagged $(APP_TAG)
+	@aws ecs update-service --region $(AWS_REGION) \
+	  --cluster "$$($(TF_OUT) app_cluster)" \
+	  --service "$$($(TF_OUT) app_service)" \
+	  --force-new-deployment --output text --query 'service.serviceName'
+	@echo "rolling — follow it with: make app-status ENV=$(ENV)"
+
+app-status: ## Running/desired counts and the last few deployment events
+	@c="$$($(TF_OUT) app_cluster)"; s="$$($(TF_OUT) app_service)"; \
+	aws ecs describe-services --region $(AWS_REGION) --cluster "$$c" --services "$$s" \
+	  --query 'services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,status:status}' \
+	  --output table; \
+	aws ecs describe-services --region $(AWS_REGION) --cluster "$$c" --services "$$s" \
+	  --query 'services[0].events[:5].message' --output text | tr '\t' '\n'
+
+app-wait: ## Block until the service is stable (what a deploy succeeding looks like)
+	@aws ecs wait services-stable --region $(AWS_REGION) \
+	  --cluster "$$($(TF_OUT) app_cluster)" \
+	  --services "$$($(TF_OUT) app_service)" && echo "stable"
+
+app-logs: ## Tail the container's stdout
+	@aws logs tail "$$($(TF_OUT) app_log_group)" --region $(AWS_REGION) \
+	  --follow --since $(SINCE)
+
+app-url: ## Print where the front end is served
+	@$(TF_OUT) app_url; echo
+
+app-dns: ## Print the record to point a domain at the load balancer
+	@$(TF) output -raw app_dns_record; echo
+
+# ECS Exec, over the same SSM channel the bastion uses. Needs
+# app_enable_execute_command = true and the session-manager-plugin installed.
+app-shell: ## Open a shell inside a running task
+	@c="$$($(TF_OUT) app_cluster)"; s="$$($(TF_OUT) app_service)"; \
+	t=$$(aws ecs list-tasks --region $(AWS_REGION) --cluster "$$c" --service-name "$$s" \
+	     --desired-status RUNNING --query 'taskArns[0]' --output text); \
+	[ "$$t" != "None" ] || { echo "no running task in $$s" >&2; exit 1; }; \
+	aws ecs execute-command --region $(AWS_REGION) --cluster "$$c" --task "$$t" \
+	  --container app --interactive --command /bin/bash
+
+app-scale: ## Set the task count: make app-scale ENV=dev COUNT=0
+	@[ -n "$(COUNT)" ] || { echo "usage: make app-scale ENV=$(ENV) COUNT=<n>" >&2; exit 1; }
+	@aws ecs update-service --region $(AWS_REGION) \
+	  --cluster "$$($(TF_OUT) app_cluster)" \
+	  --service "$$($(TF_OUT) app_service)" \
+	  --desired-count $(COUNT) --output text --query 'service.desiredCount'
+
+# ---------------------------------------------------------------------------
+# Secrets
+#
+# Terraform creates both with a placeholder and then ignores the value, so
+# these write straight to Secrets Manager and never pass through a plan or a
+# state file. A task reads its secrets once, at start, so both targets end by
+# telling you the change is not live until the service rolls.
+# ---------------------------------------------------------------------------
+
+# Read with `read -s` rather than taken as a variable: a make argument is in
+# the process list and in the shell history, which for a password is the
+# difference between a secret and a published one.
+app-password: ## Set the shared access password (prompts; never echoed)
+	@arn="$$($(TF_OUT) app_password_secret_arn)"; \
+	printf 'New shared access password: ' >&2; stty -echo 2>/dev/null; \
+	read -r p; stty echo 2>/dev/null; printf '\n' >&2; \
+	printf 'Again: ' >&2; stty -echo 2>/dev/null; \
+	read -r q; stty echo 2>/dev/null; printf '\n' >&2; \
+	[ -n "$$p" ] || { echo "empty password — the gate would be off entirely" >&2; exit 1; }; \
+	[ "$$p" = "$$q" ] || { echo "they do not match" >&2; exit 1; }; \
+	aws secretsmanager put-secret-value --region $(AWS_REGION) \
+	  --secret-id "$$arn" --secret-string "$$p" \
+	  --query 'VersionId' --output text >/dev/null; \
+	echo "stored. Running tasks keep the old one until: make app-deploy ENV=$(ENV)"
+
+app-hf-token: ## Set the HuggingFace Inference API token (prompts; never echoed)
+	@arn="$$($(TF_OUT) app_hf_token_secret_arn)"; \
+	printf 'HuggingFace API token (hf_...): ' >&2; stty -echo 2>/dev/null; \
+	read -r t; stty echo 2>/dev/null; printf '\n' >&2; \
+	[ -n "$$t" ] || { echo "empty token" >&2; exit 1; }; \
+	aws secretsmanager put-secret-value --region $(AWS_REGION) \
+	  --secret-id "$$arn" --secret-string "$$t" \
+	  --query 'VersionId' --output text >/dev/null; \
+	echo "stored. Running tasks keep the old one until: make app-deploy ENV=$(ENV)"

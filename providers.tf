@@ -6,13 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    # Used only to look up the public IP of the machine running `apply`, so the
-    # database security group can allow it without hard-coding an address that
-    # goes stale every time the ISP hands out a new lease.
-    http = {
-      source  = "hashicorp/http"
-      version = "~> 3.4"
-    }
   }
 
   # Partial backend config — bucket, key, and dynamodb_table are supplied at

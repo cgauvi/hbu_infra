@@ -3,7 +3,8 @@
 #
 # Three sources, all optional and all additive:
 #
-#   1. the public IP of whoever ran `terraform apply` (var.allow_current_ip)
+#   1. the public IP of whoever ran `terraform apply` (var.allow_current_ip,
+#      the address itself in var.current_ip)
 #   2. any extra ranges named in var.allowed_cidr_blocks
 #   3. the bastion's security group, when var.enable_bastion is on
 #
@@ -11,14 +12,15 @@
 # is a working — if useless — configuration rather than an error.
 # ---------------------------------------------------------------------------
 
-# checkip returns the caller's address as bare text plus a trailing newline.
-data "http" "current_ip" {
-  count = var.allow_current_ip ? 1 : 0
-  url   = "https://checkip.amazonaws.com"
-}
-
+# The address arrives as a variable rather than from a `data "http"` lookup:
+# behind a TLS-inspecting proxy the hashicorp/http provider cannot be installed
+# at all (Zscaler serves a block page instead of the release zip), which fails
+# `terraform init` for everyone on the network — including dev, where this
+# feature is off. The Makefile does the same lookup with one curl. See `make plan`.
 locals {
-  current_ip_cidr = var.allow_current_ip ? ["${chomp(data.http.current_ip[0].response_body)}/32"] : []
+  # Empty means nobody filled it in; the precondition below turns that into a
+  # readable failure rather than the nonsense CIDR "/32".
+  current_ip_cidr = var.allow_current_ip && var.current_ip != "" ? ["${var.current_ip}/32"] : []
   db_cidr_blocks  = distinct(concat(local.current_ip_cidr, var.allowed_cidr_blocks))
 }
 
@@ -33,6 +35,13 @@ resource "aws_security_group" "db" {
   # so replacements have to create the new one first.
   lifecycle {
     create_before_destroy = true
+
+    # Catch the combination at plan time. Without this the group would come up
+    # silently missing the one rule the operator asked for.
+    precondition {
+      condition     = !var.allow_current_ip || var.current_ip != ""
+      error_message = "allow_current_ip is true but current_ip is empty. Run `make plan ENV=${var.environment}`, which looks the address up, or pass -var current_ip=<address> yourself."
+    }
   }
 }
 
@@ -70,4 +79,19 @@ resource "aws_vpc_security_group_egress_rule" "db_all" {
   description       = "Allow all outbound"
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
+}
+
+# The application tasks reach the database by security-group reference rather
+# than by CIDR, because a Fargate task's address is assigned at start and
+# changes on every deploy. This is also what lets the database stay in the
+# private tier with no public endpoint while the app talks to it.
+resource "aws_vpc_security_group_ingress_rule" "db_from_app" {
+  count = var.enable_app ? 1 : 0
+
+  security_group_id            = aws_security_group.db.id
+  description                  = "Postgres from the application tasks"
+  referenced_security_group_id = aws_security_group.app[0].id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
 }

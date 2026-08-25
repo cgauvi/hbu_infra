@@ -26,3 +26,19 @@ variable "az_count" {
     error_message = "az_count must be at least 2 — an RDS DB subnet group requires subnets in two or more AZs."
   }
 }
+
+# ---------------------------------------------------------------------------
+# Container registry
+# ---------------------------------------------------------------------------
+
+variable "ecr_max_images" {
+  description = "How many images to keep in the repository. Old ones are expired oldest-first; anything still referenced by a running task definition is kept regardless."
+  type        = number
+  default     = 10
+}
+
+variable "ecr_force_delete" {
+  description = "Let `terraform destroy` delete the repository even while it holds images. Without it a destroy of the shared stack fails half way through."
+  type        = bool
+  default     = true
+}

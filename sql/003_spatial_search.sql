@@ -28,6 +28,12 @@ SET search_path TO rag, public;
 -- rag.chunks.feature_ids is a jsonb array of the ids the scrape saw pointing
 -- at that document. Expanding it into a join is what connects the corpus to
 -- geometry, and doing it in a view means the expansion is written once.
+--
+-- The borough is part of the match, not just of the partition: `source_table`
+-- on both sides is the file slug (`Reglement_urbanisme__VSP_REG_ZONE`), which
+-- drops the namespace the Spectrum path carries, and zone numbers restart at
+-- C01-001 in every borough. Without it a Villeray grid would come back cited
+-- by a Rosemont zone of the same number.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW rag.chunk_features AS
@@ -40,6 +46,7 @@ CREATE OR REPLACE VIEW rag.chunk_features AS
       JOIN rag.features f
         ON f.feature_id = fid.value
        AND f.source_table = c.source_table
+       AND f.neighborhood = c.neighborhood
        AND f.scrape_date = c.scrape_date;
 
 -- ---------------------------------------------------------------------------
@@ -151,6 +158,7 @@ AS $$
       JOIN rag.features f ON ST_Intersects(f.geom, lot.geom)
       JOIN rag.chunks c
         ON c.source_table = f.source_table
+       AND c.neighborhood = f.neighborhood
        AND c.scrape_date = f.scrape_date
        AND c.feature_ids ? f.feature_id
      ORDER BY c.embedding <=> query_embedding

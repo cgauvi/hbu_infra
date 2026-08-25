@@ -113,6 +113,19 @@ variable "allow_current_ip" {
   default     = true
 }
 
+variable "current_ip" {
+  description = "The address allow_current_ip refers to, as a bare IPv4 address with no mask. The Makefile fills this in from https://checkip.amazonaws.com, so it belongs on the command line rather than in a tfvars file, where it would go stale. Ignored when allow_current_ip is false."
+  type        = string
+  default     = ""
+
+  # An unreachable checkip, or a proxy answering with an HTML error page,
+  # otherwise shows up much later as a malformed CIDR from the AWS API.
+  validation {
+    condition     = var.current_ip == "" || can(cidrhost("${var.current_ip}/32", 0))
+    error_message = "current_ip must be a bare IPv4 address with no mask, e.g. 203.0.113.4."
+  }
+}
+
 variable "allowed_cidr_blocks" {
   description = "Extra CIDR blocks allowed to reach port 5432 (an office range, a VPN egress address). Added on top of allow_current_ip."
   type        = list(string)
@@ -171,4 +184,130 @@ variable "app_db_username" {
   description = "Login role the pipeline and the query side connect as — created by sql/000_roles.sql, which expects this exact name. It owns the `rag` corpus/spatial schema and the `dagster` metadata schema; the master user is only for bootstrap and migrations."
   type        = string
   default     = "urban_rag"
+}
+
+# ---------------------------------------------------------------------------
+# The web application — Fargate behind an ALB
+#
+# Off by default because of a hard ordering constraint: the service points at
+# an image tag, and a service whose tag does not exist in ECR yet cannot
+# stabilise. The sequence is `make apply-shared` (creates the repository),
+# `make app-push` (puts an image in it), then flip this on.
+# ---------------------------------------------------------------------------
+
+variable "enable_app" {
+  description = "Create the ALB, the ECS cluster, and the Fargate service running the Streamlit front end. Requires an image already pushed to the shared ECR repository."
+  type        = bool
+  default     = false
+}
+
+variable "app_image_tag" {
+  description = "Tag in the shared ECR repository to run. 'latest' pairs with `make app-deploy`, which forces a new deployment when the tag moves; pin an immutable tag or a digest for anything you want to stay put."
+  type        = string
+  default     = "latest"
+}
+
+variable "app_port" {
+  description = "Port Streamlit listens on inside the container. Matches the Dockerfile's EXPOSE and its CMD."
+  type        = number
+  default     = 8501
+}
+
+variable "app_desired_count" {
+  description = "How many tasks to run. One is enough for this workload and is what the cost model assumes; more than one is fine because the ALB is sticky, but each task holds its own session state and its own cache."
+  type        = number
+  default     = 1
+}
+
+variable "app_cpu" {
+  description = "Fargate task CPU units (1024 = 1 vCPU). The app is IO-bound on Postgres and the Inference API, so this is about cold-start speed more than throughput."
+  type        = string
+  default     = "512"
+}
+
+variable "app_memory" {
+  description = "Fargate task memory in MiB. Must be a legal pairing with app_cpu — 512 CPU allows 1024 through 4096 in 1024 steps. Folium builds whole map documents in memory, so 1024 is the sensible floor."
+  type        = string
+  default     = "1024"
+}
+
+variable "app_cpu_architecture" {
+  description = "X86_64 or ARM64. ARM64 is roughly 20% cheaper per task-hour but the image has to be built for it — `docker buildx build --platform linux/arm64` — which a stock Windows or Intel Mac build is not."
+  type        = string
+  default     = "X86_64"
+
+  validation {
+    condition     = contains(["X86_64", "ARM64"], var.app_cpu_architecture)
+    error_message = "app_cpu_architecture must be either 'X86_64' or 'ARM64'."
+  }
+}
+
+variable "app_env_mode" {
+  description = "APP_ENV inside the container. 'dev' shows the log pane in the sidebar; 'prod' hides it. A shared password is not much of a barrier in front of a log pane, so prefer 'prod' on anything public."
+  type        = string
+  default     = "prod"
+}
+
+variable "app_log_level" {
+  description = "LOG_LEVEL inside the container."
+  type        = string
+  default     = "INFO"
+}
+
+variable "app_log_retention_days" {
+  description = "Days to keep the task's CloudWatch logs."
+  type        = number
+  default     = 14
+}
+
+# ---------------------------------------------------------------------------
+# The application — reachability
+# ---------------------------------------------------------------------------
+
+variable "app_ingress_cidr_blocks" {
+  description = "Who can reach the load balancer. The default is the whole internet, which is only defensible because the app asks for a shared password before it renders anything — see app_certificate_arn for the other half of that."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "app_certificate_arn" {
+  description = "ACM certificate for an HTTPS listener. Empty means HTTP only, and the shared password is then sent in the clear — acceptable behind a narrow app_ingress_cidr_blocks, not acceptable open to the internet. Setting this adds a 443 listener and turns 80 into a redirect, in place, without replacing the load balancer or changing its DNS name."
+  type        = string
+  default     = ""
+}
+
+variable "app_idle_timeout" {
+  description = "Seconds the ALB holds an idle connection. Streamlit's websocket goes quiet while someone reads an answer, and the ALB default of 60 closes it mid-session."
+  type        = number
+  default     = 300
+}
+
+variable "app_session_duration" {
+  description = "Seconds the stickiness cookie lives. Session state is in the task's memory, so this is how long a browser keeps finding the task that holds its conversation."
+  type        = number
+  default     = 86400
+}
+
+variable "app_deletion_protection" {
+  description = "Block `terraform destroy` from deleting the load balancer. Its DNS name is what anyone with the link has bookmarked, and a replacement gets a new one."
+  type        = bool
+  default     = false
+}
+
+variable "app_wait_for_steady_state" {
+  description = "Make `terraform apply` wait for the deployment to stabilise, so a broken image fails the apply instead of failing silently in a browser. Costs a few minutes on every apply that touches the service."
+  type        = bool
+  default     = true
+}
+
+variable "app_enable_execute_command" {
+  description = "Allow `make app-shell` to open a shell inside a running task over SSM. Useful for diagnosing a connection the logs do not explain; it is also a shell inside the task role, so leave it off in prod."
+  type        = bool
+  default     = true
+}
+
+variable "app_container_insights" {
+  description = "Per-task CPU and memory metrics in CloudWatch. Billed as custom metrics, which at one task is small but not nothing."
+  type        = bool
+  default     = false
 }

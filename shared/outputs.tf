@@ -25,3 +25,18 @@ output "db_subnet_group_names" {
     private = aws_db_subnet_group.private.name
   }
 }
+
+output "ecr_repository_url" {
+  description = "Registry URL to build and push the application image to — the per-env ECS stack reads it from here"
+  value       = aws_ecr_repository.rag_map.repository_url
+}
+
+output "ecr_repository_arn" {
+  description = "ARN of the application image repository — an ECS execution role needs read on exactly this"
+  value       = aws_ecr_repository.rag_map.arn
+}
+
+output "ecr_repository_name" {
+  description = "Repository name, for `aws ecr` calls that take one rather than a URL"
+  value       = aws_ecr_repository.rag_map.name
+}
