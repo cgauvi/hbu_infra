@@ -23,6 +23,23 @@
 --   rag.lot_frontage   → primary_* and secondary_*, num_frontages
 --   rag.lot_documents  → doc_* and documents
 --
+-- Four more arrive as jsonb, handed in by the asset from the geoparquet tree
+-- rather than read out of a rag table, because none of them is loaded into
+-- Postgres at all:
+--
+--   silver/lot_zoning_envelopes        → zoning_envelopes, num_zoning_envelopes
+--   silver/vacancy_rates               → vacancy_rates, overall_vacancy_rate_pct
+--   silver/average_rents               → average_rents, overall_average_rent_cad
+--   bronze/montreal_*_costs            → construction_costs, and the six rate
+--                                        columns flattened out of it
+--
+-- The last three are figures repeated on every lot of a partition — the CMHC
+-- pair is the borough's, the cost guide's is the whole city's. That is
+-- deliberate: it is what let silver/lots_with_vacancy_rates go, an asset whose
+-- whole job was pivoting the CMHC grid onto the cadastre one layer earlier —
+-- where it rode through rag.lots.attributes and every spatial join downstream
+-- without anything reading it.
+--
 -- No `-- requires:` header, unlike 006 and 003. The table below names only
 -- rag.lots, so it can be created on a database that has never held a chunk;
 -- what needs rag.lot_documents is the pipeline that fills it, and that check
@@ -117,11 +134,133 @@ CREATE TABLE IF NOT EXISTS rag.lot_profiles (
     -- published layers.
     documents        jsonb NOT NULL DEFAULT '[]'::jsonb,
 
+    -- -- what may be built on it ------------------------------------------
+    --
+    -- silver/lot_zoning_envelopes holds one row per (lot, grid column) — the
+    -- grain urban_rag.program solves at — and this is that lot's rows, the
+    -- zone covering most of it first. jsonb rather than a child table for the
+    -- same reason `documents` is: nothing joins to it, it is read whole with
+    -- the row, and a lot straddling two zones legitimately has half a dozen
+    -- entries. Each object carries the zone it came from, the usages its
+    -- column heads, and every norm that column states, so a reader holding one
+    -- profile row has what solve_program needs without opening the silver
+    -- parquet.
+    --
+    -- `governs_residential` inside an entry marks the column
+    -- select_residential_column picks for this lot's width. There is at most
+    -- one per (lot, zone) and often none — a lot whose zone published no
+    -- readable grid has no entry at all — so it is not flattened into a column
+    -- of its own the way doc_url is.
+    num_zoning_envelopes integer NOT NULL DEFAULT 0,
+    zoning_envelopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+
+    -- -- what the rental market around it looks like -----------------------
+    --
+    -- CMHC surveys neighborhoods, not parcels, so these two are the
+    -- *borough's* figures and are identical on every lot of a (neighborhood,
+    -- scrape_date). They are here rather than in a table of their own because
+    -- the question this one is read for — what is this parcel worth building —
+    -- is asked one lot at a time and answered against the market the lot sits
+    -- in. Denormalising a dozen survey cells onto every row is the same trade
+    -- `documents` makes, and the same one silver/lots_with_vacancy_rates used
+    -- to make by pivoting the grid onto the cadastre itself; doing it here
+    -- instead is what let that asset go.
+    --
+    -- Objects rather than arrays: {survey_year, survey_period,
+    -- num_quartiers_mapped, overall_*, cells: [...]}. The provenance is what
+    -- makes the cells readable — a borough figure is the unweighted mean of
+    -- its quartiers, most of them suppressed, so `num_quartiers` on each cell
+    -- is the denominator that mean was actually taken over.
+    --
+    -- '{}' and a published-but-empty grid are different answers: an empty
+    -- object is a partition whose CMHC silver asset has not run, while an
+    -- object whose cells all read null is a borough CMHC suppresses entirely.
+    -- Both happen, and only the first is a pipeline problem.
+    vacancy_rates    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- The all-dwellings x all-bedrooms cell, flattened out of the object above
+    -- so the common read is a column — the same rule doc_url follows. NULL
+    -- when CMHC suppressed it, which for a small borough is most years.
+    overall_vacancy_rate_pct double precision,
+    average_rents    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- The all-bedrooms cell, same rule.
+    overall_average_rent_cad double precision,
+
+    -- -- what it costs to build there --------------------------------------
+    --
+    -- The Altus Group Canadian Cost Guide's Montreal column, as
+    -- bronze/montreal_residential_costs and bronze/montreal_nonresidential_costs
+    -- publish it. City-wide figures, so — like the CMHC pair above, only more
+    -- so — they are identical on every row of the partition and there is
+    -- nothing per-lot to join on: the guide prices nine Canadian markets and
+    -- knows nothing about boroughs, let alone parcels. They are here for the
+    -- same reason the rents are: the question this table is read for is what a
+    -- parcel is worth building, and that is a rent on one side and a cost per
+    -- square foot on the other, asked one lot at a time.
+    --
+    -- {source_url, source_last_modified, cost_scrape_date, city, city_label,
+    --  condo_band, parking: [...], residential: [...]} — each entry carrying
+    --  the publisher's own id, label, rate_low, rate_high and unit_flag.
+    -- '{}' is a partition whose bronze snapshot has not been read, which is a
+    -- different answer from a guide that priced nothing.
+    construction_costs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Dollars per *stall*, not per square foot — the guide flags these rows
+    -- `perStall` and it is the reason unit_flag travels in the jsonb at all.
+    -- Underground (`parkade_ug`) is the dearer per stall and the larger per
+    -- stall; the integrated ground-level garage (`parkade_ag`) is cheaper but
+    -- burns floor area the envelope would rather spend on dwellings, which is
+    -- what makes the choice between them a choice. urban_rag.program solves it,
+    -- against the midpoints of exactly these two pairs.
+    underground_stall_cost_low_cad  double precision,
+    underground_stall_cost_high_cad double precision,
+    above_grade_stall_cost_low_cad  double precision,
+    above_grade_stall_cost_high_cad double precision,
+
+    -- Dollars per square foot to build the condominium / apartment band named
+    -- by `construction_costs ->> 'condo_band'`, flattened out of the object
+    -- above so the common read is a column — the same rule doc_url and
+    -- overall_average_rent_cad follow. Which band that is, is a judgement about
+    -- the built form rather than a property of the data (wood frame up to six
+    -- storeys is what a borough of triplexes builds; a downtown lot is not),
+    -- so it is configured per run and named on every row — the same rule
+    -- max_built_area_m2 follows. The other four bands stay in the jsonb.
+    condo_cost_low_cad_sqft  double precision,
+    condo_cost_high_cad_sqft double precision,
+
     geom             geometry(MultiPolygon, 4326),
     -- One profile per lot. rag.lots already scopes lot_uid to a single
     -- (lot_number, scrape_date), so this is the grain the table declares.
     UNIQUE (lot_uid)
 );
+
+-- ---------------------------------------------------------------------------
+-- Widening an existing table
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
+-- rag.lot_profiles, so every column added after the first release has to arrive
+-- here. ADD COLUMN IF NOT EXISTS makes each one idempotent, and the defaults
+-- mean existing rows read as "nothing was carried" rather than NULL — which is
+-- the truth about them until their partition is recomputed. It runs ahead of
+-- the indexes below because one of them is on a column it adds.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE rag.lot_profiles
+    ADD COLUMN IF NOT EXISTS num_zoning_envelopes integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS zoning_envelopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS vacancy_rates jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS overall_vacancy_rate_pct double precision,
+    ADD COLUMN IF NOT EXISTS average_rents jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS overall_average_rent_cad double precision,
+    -- The construction-cost block. Every rate column is nullable with no
+    -- default: a row written before the guide was read has no rate, and 0 would
+    -- claim the guide priced the work at nothing.
+    ADD COLUMN IF NOT EXISTS construction_costs jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS underground_stall_cost_low_cad double precision,
+    ADD COLUMN IF NOT EXISTS underground_stall_cost_high_cad double precision,
+    ADD COLUMN IF NOT EXISTS above_grade_stall_cost_low_cad double precision,
+    ADD COLUMN IF NOT EXISTS above_grade_stall_cost_high_cad double precision,
+    ADD COLUMN IF NOT EXISTS condo_cost_low_cad_sqft double precision,
+    ADD COLUMN IF NOT EXISTS condo_cost_high_cad_sqft double precision;
 
 CREATE INDEX IF NOT EXISTS lot_profiles_geom_idx ON rag.lot_profiles USING gist (geom);
 CREATE INDEX IF NOT EXISTS lot_profiles_number_idx ON rag.lot_profiles (lot_number);
@@ -137,6 +276,11 @@ CREATE INDEX IF NOT EXISTS lot_profiles_frontage_idx
     ON rag.lot_profiles (neighborhood, scrape_date, primary_frontage_m DESC);
 CREATE INDEX IF NOT EXISTS lot_profiles_documents_idx
     ON rag.lot_profiles USING gin (documents);
+-- "Which lots does this zone govern" and "which lots can be solved for
+-- housing" are both containment queries over the array, the same shape the
+-- documents index serves.
+CREATE INDEX IF NOT EXISTS lot_profiles_envelopes_idx
+    ON rag.lot_profiles USING gin (zoning_envelopes);
 
 DO $$
 DECLARE
