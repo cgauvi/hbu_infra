@@ -17,7 +17,7 @@ resource "aws_security_group" "alb" {
   count = var.enable_app ? 1 : 0
 
   name        = "${local.prefix}-alb-sg"
-  description = "Public ingress for ${local.prefix} — the only internet-facing SG in this stack"
+  description = "Public ingress for ${local.prefix} - the only internet-facing SG in this stack"
   vpc_id      = data.terraform_remote_state.shared.outputs.vpc_id
 
   tags = { Name = "${local.prefix}-alb-sg" }

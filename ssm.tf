@@ -109,10 +109,19 @@ resource "aws_ssm_parameter" "db_app_user" {
 
 data "aws_iam_policy_document" "db_access" {
   statement {
-    sid       = "ReadConnectionParameters"
-    effect    = "Allow"
-    actions   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
-    resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.prefix}/*"]
+    sid     = "ReadConnectionParameters"
+    effect  = "Allow"
+    actions = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
+
+    # Two ARNs, not one. GetParameter matches the child parameters under
+    # /<prefix>/*, but GetParametersByPath authorizes against the *path* it is
+    # handed — arn:...:parameter/<prefix> — and "/<prefix>/*" does not match a
+    # string with no trailing slash. Without the bare-prefix ARN the app's
+    # get_parameters_by_path(Path="/<prefix>") call is denied.
+    resources = [
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.prefix}",
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.prefix}/*",
+    ]
   }
 
   statement {
