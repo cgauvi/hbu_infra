@@ -144,6 +144,11 @@ output "app_hf_token_secret_arn" {
   value       = one(aws_secretsmanager_secret.hf_token[*].arn)
 }
 
+output "app_mapbox_token_secret_arn" {
+  description = "Secrets Manager ARN holding the Mapbox public token for the basemap. Optional — set with `make app-mapbox-token`; left at the placeholder the map uses OpenStreetMap."
+  value       = one(aws_secretsmanager_secret.mapbox_token[*].arn)
+}
+
 # ---------------------------------------------------------------------------
 # Pointing a domain at the load balancer
 #

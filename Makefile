@@ -5,13 +5,14 @@
 #   make apply-shared               # VPC, subnets, DB subnet groups, ECR repo
 #   make apply       ENV=dev        # RDS, security group, SSM contract
 #   make db-bootstrap ENV=dev       # urban_rag role + grants + its password
-#   make db-init     ENV=dev        # postgis + pgvector + rag/dagster schemas
+#   make db-init     ENV=dev        # postgis + pgvector + rag/silver/gold schemas
 #
 #   # then the web app, in this order — the service cannot start against a
 #   # tag that is not in ECR yet:
 #   make app-push     ENV=dev       # build ../hbu_rag_map, push :latest
 #   make app-password ENV=dev       # the shared password people log in with
 #   make app-hf-token ENV=dev       # the Inference API token
+#   make app-mapbox-token ENV=dev   # the Mapbox basemap token (optional; OSM without it)
 #   make plan apply   ENV=dev       # with enable_app = true in dev.tfvars
 #   make app-url      ENV=dev       # where it ended up
 #   make app-dns      ENV=dev       # the record to point a domain at it
@@ -177,7 +178,7 @@ DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tu
         db-deps uv-check db-init db-check db-shell db-url db-env db-query db-wait \
         db-start db-stop db-tunnel \
         app-login app-build app-push app-deploy app-status app-wait app-logs \
-        app-url app-dns app-shell app-scale app-password app-hf-token
+        app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -189,7 +190,7 @@ init plan apply destroy validate output: | aws-check
 db-init db-bootstrap db-ca db-check db-shell db-url db-env db-app-env \
 db-query db-wait db-start db-stop db-tunnel: | aws-check
 app-login app-build app-push app-deploy app-status app-wait app-logs \
-app-url app-dns app-shell app-scale app-password app-hf-token: | aws-check
+app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token: | aws-check
 
 # Every target that talks to AWS goes through here first. Without it the wrong
 # credentials are invisible: BUCKET and the /$(PROJECT)-$(ENV) parameter
@@ -304,7 +305,7 @@ uv-check:
 	  echo "uv installed but not on this PATH — open a new shell and re-run"; exit 1; \
 	}
 
-db-init: ## Apply sql/*.sql — roles, extensions, rag.features, rag.lots, spatial search
+db-init: ## Apply sql/*.sql — roles, extensions, the rag working set, the silver/gold tables
 	$(DB) init
 
 # sql/000_roles.sql is applied by db-init too, since it sorts first. What only
@@ -316,7 +317,7 @@ db-bootstrap: ## Create the urban_rag role + grants, storing its password in Sec
 db-ca: ## Download the RDS root certificate that sslmode=verify-full needs
 	$(DB) ca
 
-db-check: ## Report extensions, tables, and what is loaded
+db-check: ## Report extensions, tables, partitions, and what is loaded
 	$(DB) check
 
 db-shell: ## Interactive SQL (psql when installed, built-in REPL otherwise)
@@ -363,6 +364,7 @@ SINCE ?= 10m
 #   make app-push     ENV=dev     # build the image and push it
 #   make app-password ENV=dev     # the shared password people log in with
 #   make app-hf-token ENV=dev     # the Inference API token
+#   make app-mapbox-token ENV=dev # the Mapbox basemap token (optional; OSM without it)
 #   make plan apply   ENV=dev     # with enable_app = true in dev.tfvars
 #   make app-url      ENV=dev     # where it ended up
 #   make app-dns      ENV=dev     # the record to point a domain at it
@@ -487,6 +489,21 @@ app-password: ## Set the shared access password (prompts; never echoed)
 app-hf-token: ## Set the HuggingFace Inference API token (prompts; never echoed)
 	@arn="$$($(TF_OUT) app_hf_token_secret_arn)"; \
 	printf 'HuggingFace API token (hf_...): ' >&2; stty -echo 2>/dev/null; \
+	read -r t; stty echo 2>/dev/null; printf '\n' >&2; \
+	[ -n "$$t" ] || { echo "empty token" >&2; exit 1; }; \
+	aws secretsmanager put-secret-value --region $(AWS_REGION) \
+	  --secret-id "$$arn" --secret-string "$$t" \
+	  --query 'VersionId' --output text >/dev/null; \
+	echo "stored. Running tasks keep the old one until: make app-deploy ENV=$(ENV)"
+
+# A Mapbox *public* token (pk....). Unlike the two above it is not really a
+# secret — it ships to the browser inside every tile URL — but it is kept out
+# of git and out of state the same way, and restricting it to the app's
+# domain(s) in the Mapbox console is what actually guards it. Left unset the
+# map falls back to OpenStreetMap, so this target is optional.
+app-mapbox-token: ## Set the Mapbox basemap token (prompts; optional — OSM without it)
+	@arn="$$($(TF_OUT) app_mapbox_token_secret_arn)"; \
+	printf 'Mapbox public token (pk....): ' >&2; stty -echo 2>/dev/null; \
 	read -r t; stty echo 2>/dev/null; printf '\n' >&2; \
 	[ -n "$$t" ] || { echo "empty token" >&2; exit 1; }; \
 	aws secretsmanager put-secret-value --region $(AWS_REGION) \

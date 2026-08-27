@@ -1,8 +1,8 @@
 -- requires: rag.chunks
 --
--- Lot -> PDF. The last hop of the chain 005_lot_features.sql opens up.
+-- Lot -> PDF. The last hop of the chain 005_silver_lot_features.sql opens up.
 --
--- `rag.lot_features` says which map features cover a lot;
+-- `silver.lot_features` says which map features cover a lot;
 -- `rag.chunks.feature_ids` says which features cite each document. Putting the
 -- two together is what turns "lot 1 234 567" into "this zone's grille des
 -- usages et des normes", which is the document a highest-and-best-use question
@@ -14,8 +14,8 @@
 -- 003_spatial_search.sql; see its header for why skipping beats failing.
 --
 -- Ordering note: this file sorts after 005, which is what lets it name
--- rag.lot_features in a view body. 003_spatial_search.sql cannot, which is why
--- rag.search_at_lot there still does the lot x feature intersection inline.
+-- silver.lot_features in a view body. 003_spatial_search.sql cannot, which is
+-- why rag.search_at_lot there still does the lot x feature intersection inline.
 -- That function answers from a point and stays the entry point for "what
 -- applies here"; this view answers from a lot already identified, off a join
 -- that has already been computed.
@@ -58,7 +58,7 @@ CREATE OR REPLACE VIEW rag.lot_documents AS
            d.doc_id,
            d.url,
            d.title
-      FROM rag.lot_features lf
+      FROM silver.lot_features lf
       JOIN rag.lots l USING (lot_uid)
       JOIN documents d
         ON d.source_table = lf.source_table
@@ -75,7 +75,7 @@ CREATE OR REPLACE VIEW rag.lot_documents AS
 -- The companion to rag.search_at_lot, entered from the other end. That one
 -- takes a point, finds the lot under it and intersects features on the fly;
 -- this one takes the lot number - which is what a user actually has - and
--- reads the join back out of rag.lot_features instead of recomputing it.
+-- reads the join back out of silver.lot_features instead of recomputing it.
 --
 -- `min_pct_of_lot` is the sliver cutoff, defaulted to 0 so the answer includes
 -- everything unless the caller says otherwise. 1.0 is a reasonable value once
@@ -117,7 +117,7 @@ AS $$
         SELECT lf.feature_id, lf.source_table, lf.pct_of_lot,
                lf.neighborhood, lf.scrape_date, lot.lot_number
           FROM lot
-          JOIN rag.lot_features lf USING (lot_uid)
+          JOIN silver.lot_features lf USING (lot_uid)
          WHERE lf.pct_of_lot >= min_pct_of_lot
            AND (on_source_table IS NULL OR lf.source_table = on_source_table)
     )

@@ -85,11 +85,14 @@ resource "aws_vpc_security_group_egress_rule" "app_all" {
 # ---------------------------------------------------------------------------
 # Secrets the container is handed at start
 #
-# Both follow the pattern ssm.tf established for the app-role password:
+# All three follow the pattern ssm.tf established for the app-role password:
 # Terraform owns the secret, not the value. The placeholder is written once
 # and ignore_changes keeps a later apply from reverting whatever was put there
-# by `make app-password` or `make app-hf-token` — so a rotated token never has
-# to pass through a plan and never lands in state.
+# by `make app-password`, `make app-hf-token` or `make app-mapbox-token` — so a
+# rotated token never has to pass through a plan and never lands in state.
+#
+# The Mapbox token is optional: left at the placeholder, basemap.py reads that
+# as "unset" and the map falls back to OpenStreetMap.
 # ---------------------------------------------------------------------------
 
 resource "aws_secretsmanager_secret" "app_password" {
@@ -125,6 +128,26 @@ resource "aws_secretsmanager_secret_version" "hf_token" {
   count = var.enable_app ? 1 : 0
 
   secret_id     = aws_secretsmanager_secret.hf_token[0].id
+  secret_string = "PLACEHOLDER"
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+resource "aws_secretsmanager_secret" "mapbox_token" {
+  count = var.enable_app ? 1 : 0
+
+  name        = "${local.prefix}/app/mapbox-token"
+  description = "Mapbox public token (pk....) for the basemap. Optional - at the placeholder the map falls back to OpenStreetMap."
+
+  recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret_version" "mapbox_token" {
+  count = var.enable_app ? 1 : 0
+
+  secret_id     = aws_secretsmanager_secret.mapbox_token[0].id
   secret_string = "PLACEHOLDER"
 
   lifecycle {
@@ -200,6 +223,7 @@ data "aws_iam_policy_document" "app_execution_secrets" {
     resources = [
       aws_secretsmanager_secret.app_password[0].arn,
       aws_secretsmanager_secret.hf_token[0].arn,
+      aws_secretsmanager_secret.mapbox_token[0].arn,
     ]
   }
 }
@@ -322,6 +346,12 @@ resource "aws_ecs_task_definition" "app" {
         {
           name      = "HUGGINGFACE_API_TOKEN"
           valueFrom = aws_secretsmanager_secret.hf_token[0].arn
+        },
+        # Optional. A "PLACEHOLDER" value means unset — basemap.py then draws
+        # OpenStreetMap tiles instead of Mapbox.
+        {
+          name      = "MAPBOX_TOKEN"
+          valueFrom = aws_secretsmanager_secret.mapbox_token[0].arn
         },
       ]
 

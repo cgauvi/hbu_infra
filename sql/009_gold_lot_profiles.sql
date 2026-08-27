@@ -1,5 +1,5 @@
--- Every lot in a borough, with what stands on it, what it faces, and what
--- governs it — one row per cadastral parcel.
+-- gold.lot_profiles — every lot in a borough, with what stands on it, what it
+-- faces, and what governs it. One row per cadastral parcel.
 --
 -- The gold table of the lot lineage, and the one a highest-and-best-use
 -- question is read out of. It replaces an earlier `rag.vacant_lots`, which
@@ -9,23 +9,24 @@
 -- carrying `has_building` instead costs one boolean and makes the vacant-land
 -- question a filter rather than a table —
 --
---     SELECT * FROM rag.lot_profiles WHERE NOT has_building
+--     SELECT * FROM gold.lot_profiles WHERE NOT has_building
 --
 -- — while leaving "the widest built lots on Rue Jarry" answerable from the
 -- same rows. That is why this file exists and 009_vacant_lots.sql never did.
 --
 -- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_profiles) once
--- that borough's rag.building_lots, rag.lot_frontage and rag.lot_features rows
--- have landed — see its README. Three joins collapse into this one table, each
--- from one row per (lot × something) down to one row per lot:
+-- that borough's silver.building_lot_intersections, silver.lot_frontage and
+-- silver.lot_features rows have landed — see its README. Three joins collapse
+-- into this one table, each from one row per (lot × something) down to one row
+-- per lot:
 --
---   rag.building_lots  → num_buildings, built_area_m2, category
---   rag.lot_frontage   → primary_* and secondary_*, num_frontages
---   rag.lot_documents  → doc_* and documents
+--   silver.building_lot_intersections → num_buildings, built_area_m2, category
+--   silver.lot_frontage               → primary_* and secondary_*, num_frontages
+--   rag.lot_documents                 → doc_* and documents
 --
 -- Four more arrive as jsonb, handed in by the asset from the geoparquet tree
--- rather than read out of a rag table, because none of them is loaded into
--- Postgres at all:
+-- rather than read out of a table, because none of them is loaded into
+-- Postgres at the grain this one needs:
 --
 --   silver/lot_zoning_envelopes        → zoning_envelopes, num_zoning_envelopes
 --   silver/vacancy_rates               → vacancy_rates, overall_vacancy_rate_pct
@@ -45,24 +46,40 @@
 -- what needs rag.lot_documents is the pipeline that fills it, and that check
 -- lives in compute_lot_profiles where it can say which file to apply.
 --
--- Refreshed the way every other derived table here is: a (neighborhood,
--- scrape_date) partition is deleted and reinserted, not upserted row by row.
+-- ---------------------------------------------------------------------------
+-- Moved from rag.lot_profiles
+-- ---------------------------------------------------------------------------
 --
--- Owned by the same role as the rest of `rag`, handed over below.
+-- `lot_profiles` is a gold asset, so its table is in `gold` and partitioned by
+-- neighborhood and scrape date like every other one — see 003_warehouse.sql.
+-- The surrogate `lot_profile_uid` is gone with the move (a partitioned table's
+-- primary key must contain the partition keys, and no reader ever cited it),
+-- and the grain the old UNIQUE (lot_uid) declared is now stated in the column
+-- that survives a reload:
+--
+--     PRIMARY KEY (scrape_date, neighborhood, lot_number)
+--
+-- which is what the pipeline's upsert conflicts on. `lot_uid` stays as a plain
+-- column: it is the bigserial rag.lots mints, useful for joining back to the
+-- cadastre within a partition and worthless across one.
+--
+-- The old table is left in place; drop it once nothing reads it:
+--
+--     DROP TABLE IF EXISTS rag.lot_profiles;
+--
+-- Owned by the pipeline's role, handed over below.
 
-SET search_path TO rag, public;
+SET search_path TO gold, public;
 
-CREATE TABLE IF NOT EXISTS rag.lot_profiles (
-    lot_profile_uid  bigserial PRIMARY KEY,
-    lot_uid          bigint NOT NULL REFERENCES rag.lots (lot_uid) ON DELETE CASCADE,
-    -- Denormalised from rag.lots for the same reason rag.lot_frontage carries
-    -- cote_rue_id: lot_uid is a bigserial a reload mints again, and the lot
-    -- number is what survives one.
-    lot_number       text NOT NULL,
-    neighborhood     text NOT NULL,
+CREATE TABLE IF NOT EXISTS gold.lot_profiles (
+    -- The partition key leads, in the order 003_warehouse.sql explains.
     scrape_date      date NOT NULL,
+    neighborhood     text NOT NULL,
+    -- Infolot's own lot number, and the key of this table: rag.lots.lot_uid is
+    -- a bigserial a reload mints again, and the number is what survives one.
+    lot_number       text NOT NULL,
+    lot_uid          bigint REFERENCES rag.lots (lot_uid) ON DELETE CASCADE,
     lot_area_m2      double precision,
-
     -- -- what stands on it --------------------------------------------------
     --
     -- `has_building` is the plain reading of the question — does any footprint
@@ -87,13 +104,13 @@ CREATE TABLE IF NOT EXISTS rag.lot_profiles (
     category         text NOT NULL,
     -- The cutoff `category` was computed with, in m2 of footprint. The word
     -- 'shed_only' means nothing without it, so it travels on every row rather
-    -- than only in the run's config — the same rule rag.lot_frontage.buffer_m
+    -- than only in the run's config — the same rule silver.lot_frontage.buffer_m
     -- follows.
     max_built_area_m2 double precision NOT NULL,
 
     -- -- what it faces -----------------------------------------------------
     --
-    -- rag.lot_frontage holds one row per (lot, street side); these are its top
+    -- silver.lot_frontage holds one row per (lot, street side); these are its top
     -- two, pivoted. Ranks beyond the second are dropped from the columns but
     -- still counted in num_frontages and summed into total_frontage_m, so a
     -- lot facing three streets stays visible as one without every other row
@@ -111,7 +128,7 @@ CREATE TABLE IF NOT EXISTS rag.lot_profiles (
     secondary_frontage_m  double precision,
     secondary_street_name text,
     secondary_cote_rue_id text,
-    -- The buffer rag.lot_frontage was computed with, carried for the same
+    -- The buffer silver.lot_frontage was computed with, carried for the same
     -- reason max_built_area_m2 is. NULL when the lot has no frontage row to
     -- take it from.
     frontage_buffer_m double precision,
@@ -228,59 +245,52 @@ CREATE TABLE IF NOT EXISTS rag.lot_profiles (
     condo_cost_high_cad_sqft double precision,
 
     geom             geometry(MultiPolygon, 4326),
-    -- One profile per lot. rag.lots already scopes lot_uid to a single
-    -- (lot_number, scrape_date), so this is the grain the table declares.
-    UNIQUE (lot_uid)
-);
+    loaded_at        timestamptz NOT NULL DEFAULT now(),
+    -- One profile per lot per borough-day. rag.lots already scopes a lot
+    -- number to a single (borough, scrape_date), so this is the grain the
+    -- table declares and the conflict target the upsert names.
+    PRIMARY KEY (scrape_date, neighborhood, lot_number)
+) PARTITION BY LIST (neighborhood);
 
 -- ---------------------------------------------------------------------------
 -- Widening an existing table
 --
 -- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
--- rag.lot_profiles, so every column added after the first release has to arrive
--- here. ADD COLUMN IF NOT EXISTS makes each one idempotent, and the defaults
--- mean existing rows read as "nothing was carried" rather than NULL — which is
--- the truth about them until their partition is recomputed. It runs ahead of
--- the indexes below because one of them is on a column it adds.
+-- gold.lot_profiles, so a column added after this file first ran has to arrive
+-- as an ALTER here, the way the seven that arrived after rag.lot_profiles's
+-- first release did:
+--
+--     ALTER TABLE gold.lot_profiles
+--         ADD COLUMN IF NOT EXISTS <name> <type> ...;
+--
+-- ADD COLUMN IF NOT EXISTS makes each one idempotent, and a default means
+-- existing rows read as "nothing was carried" rather than NULL — which is the
+-- truth about them until their partition is recomputed. It goes here, ahead of
+-- the indexes, in case one of them is on a column it adds.
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE rag.lot_profiles
-    ADD COLUMN IF NOT EXISTS num_zoning_envelopes integer NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS zoning_envelopes jsonb NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS vacancy_rates jsonb NOT NULL DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS overall_vacancy_rate_pct double precision,
-    ADD COLUMN IF NOT EXISTS average_rents jsonb NOT NULL DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS overall_average_rent_cad double precision,
-    -- The construction-cost block. Every rate column is nullable with no
-    -- default: a row written before the guide was read has no rate, and 0 would
-    -- claim the guide priced the work at nothing.
-    ADD COLUMN IF NOT EXISTS construction_costs jsonb NOT NULL DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS underground_stall_cost_low_cad double precision,
-    ADD COLUMN IF NOT EXISTS underground_stall_cost_high_cad double precision,
-    ADD COLUMN IF NOT EXISTS above_grade_stall_cost_low_cad double precision,
-    ADD COLUMN IF NOT EXISTS above_grade_stall_cost_high_cad double precision,
-    ADD COLUMN IF NOT EXISTS condo_cost_low_cad_sqft double precision,
-    ADD COLUMN IF NOT EXISTS condo_cost_high_cad_sqft double precision;
-
-CREATE INDEX IF NOT EXISTS lot_profiles_geom_idx ON rag.lot_profiles USING gist (geom);
-CREATE INDEX IF NOT EXISTS lot_profiles_number_idx ON rag.lot_profiles (lot_number);
-CREATE INDEX IF NOT EXISTS lot_profiles_partition_idx
-    ON rag.lot_profiles (neighborhood, scrape_date);
+-- Created on the parent, so every partition warehouse.ensure_partition adds
+-- gets them without anyone remembering to. The (neighborhood, scrape_date)
+-- index the old table needed is gone: that filter is now partition pruning.
+CREATE INDEX IF NOT EXISTS lot_profiles_geom_idx
+    ON gold.lot_profiles USING gist (geom);
+CREATE INDEX IF NOT EXISTS lot_profiles_number_idx
+    ON gold.lot_profiles (lot_number);
 -- "The empty parcels in this borough, widest first" is the read that used to
 -- be a table of its own, so it gets the index that table would have had.
 CREATE INDEX IF NOT EXISTS lot_profiles_vacant_idx
-    ON rag.lot_profiles (neighborhood, scrape_date, primary_frontage_m DESC)
+    ON gold.lot_profiles (primary_frontage_m DESC)
     WHERE NOT has_building;
 -- "The widest lots in this borough" over the whole inventory, built or not.
 CREATE INDEX IF NOT EXISTS lot_profiles_frontage_idx
-    ON rag.lot_profiles (neighborhood, scrape_date, primary_frontage_m DESC);
+    ON gold.lot_profiles (primary_frontage_m DESC);
 CREATE INDEX IF NOT EXISTS lot_profiles_documents_idx
-    ON rag.lot_profiles USING gin (documents);
+    ON gold.lot_profiles USING gin (documents);
 -- "Which lots does this zone govern" and "which lots can be solved for
 -- housing" are both containment queries over the array, the same shape the
 -- documents index serves.
 CREATE INDEX IF NOT EXISTS lot_profiles_envelopes_idx
-    ON rag.lot_profiles USING gin (zoning_envelopes);
+    ON gold.lot_profiles USING gin (zoning_envelopes);
 
 DO $$
 DECLARE
@@ -294,10 +304,10 @@ BEGIN
         RETURN;
     END IF;
 
-    EXECUTE format('ALTER TABLE rag.lot_profiles OWNER TO %I', app_role);
+    EXECUTE format('ALTER TABLE gold.lot_profiles OWNER TO %I', app_role);
 
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ro_role) THEN
-        EXECUTE format('GRANT SELECT ON rag.lot_profiles TO %I', ro_role);
+        EXECUTE format('GRANT SELECT ON gold.lot_profiles TO %I', ro_role);
     END IF;
 END
 $$;

@@ -57,15 +57,16 @@ and their state key.
 │                               ▼                                        │
 │  private  RDS PostgreSQL 16 — no public endpoint                       │
 │           postgis · pgvector · pg_trgm                                 │
-│           rag.chunks        ← hbu_dataplatform                         │
-│           rag.features      ← this repo                                │
-│           rag.lots          ← this repo                                │
-│           rag.buildings     ← this repo                                │
-│           rag.building_lots ← this repo                                │
-│           rag.lot_features  ← this repo                                │
-│           rag.streets       ← this repo                                │
-│           rag.lot_frontage  ← this repo                                │
-│           rag.lot_profiles  ← this repo                                │
+│                                                                        │
+│           rag.chunks      ← hbu_dataplatform    the vector index       │
+│           rag.features    ← this repo  ┐                               │
+│           rag.lots        ← this repo  ├ the spatial working set       │
+│           rag.buildings   ← this repo  ┘                               │
+│                                                                        │
+│           silver.*  ← this repo   one table per silver asset,          │
+│           gold.*    ← this repo   partitioned by (neighborhood,        │
+│                                   scrape_date) and upserted            │
+│           warehouse.ensure_partition — creates a leaf on demand        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,16 +105,24 @@ What this repo owns is everything that table cannot create for itself:
 
 | Object | Why it is here |
 |---|---|
-| `urban_rag`, `urban_rag_ro`, schemas `rag` and `dagster` | Creating a role and the schemas it owns needs the master user, and the master credentials are resolved here |
+| `urban_rag`, `urban_rag_ro`, schemas `rag`, `silver`, `gold`, `warehouse`, `dagster` | Creating a role and the schemas it owns needs the master user, and the master credentials are resolved here |
 | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements` | `CREATE EXTENSION` needs `rds_superuser`, which the pipeline's role must not have |
-| `rag.features`, `rag.lots`, `rag.buildings` | The geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
-| `rag.building_lots` | Which buildings sit on which lots, computed with `ST_Intersection` — a building spanning several lots gets one row per lot, holding just the clipped slice and its share of the footprint. Populated by `hbu_dataplatform` (`urban_rag.postgis`), from that borough's latest `rag.buildings`/`rag.lots` rows |
-| `rag.lot_features` | Which map features cover which lot — the same clip one layer over, and the hop that gives a lot its documents. A lot has no zoning id to link on: the cadastre is provincial (Infolot, `NO_LOT`) and the zoning is municipal (Spectrum, `NUMERO_COMPLET`), so the two are joined by geometry or not at all. Populated by `hbu_dataplatform` (`urban_rag.postgis`), which also fills `rag.features` |
-| `rag.streets` | The sides of the roadway, from Montreal's *géobase double* — one row per `COTE_RUE_ID`, already clipped to a borough by the pipeline. Lines, so `length_m` rather than `area_m2`. Populated by `hbu_dataplatform` (`urban_rag.postgis`) |
-| `rag.lot_frontage` | How much of each lot's boundary faces each street side, in metres. Measured on `ST_Boundary(lot)` against a buffered street, not on the lot itself — `ST_Length` of a polygon is 0. `frontage_rank = 1` is the street a lot mostly fronts on. Populated by `hbu_dataplatform` (`urban_rag.postgis`), from that borough's `rag.lots`/`rag.streets` rows |
-| `rag.lot_profiles` | Every lot in a borough at the grain a question is asked about — one row per parcel, carrying whether a building stands on it and how many, its primary and secondary street frontage, the document that governs it, the zoning envelopes that bound what may be built on it (`zoning_envelopes`), the borough's CMHC vacancy and rent grids (`vacancy_rates`, `average_rents`) and what it costs to build there (`construction_costs`, with the underground and integrated ground-level parking rates flattened into `underground_stall_cost_low/high_cad` and `above_grade_stall_cost_low/high_cad` — dollars per stall — and the configured condominium / apartment band into `condo_cost_low/high_cad_sqft`). The three joins above each hold one row per (lot × something); this is where they collapse onto the lot, alongside four more jsonb columns the dataplatform hands in from its geoparquet tree, since nothing loads those into Postgres. Replaces an earlier `rag.vacant_lots`, which kept only the parcels it found nothing on and so could answer one question at the cost of hiding every other lot — `WHERE NOT has_building` is that selection now. Populated by `hbu_dataplatform` (`urban_rag.postgis`) |
+| `rag.features`, `rag.lots`, `rag.buildings` | The spatial working set: the geometry the joins below are computed over, and the geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
+| `warehouse.ensure_partition`, `warehouse.partitions` | Creates a `silver`/`gold` leaf on demand, and lists the ones that exist — see [How the silver and gold tables are shaped](#how-the-silver-and-gold-tables-are-shaped) |
+| `silver.building_lot_intersections` | Which buildings sit on which lots, computed with `ST_Intersection` — a building spanning several lots gets one row per lot, holding just the clipped slice and its share of the footprint |
+| `silver.lot_features` | Which map features cover which lot — the same clip one layer over, and the hop that gives a lot its documents. A lot has no zoning id to link on: the cadastre is provincial (Infolot, `NO_LOT`) and the zoning is municipal (Spectrum, `NUMERO_COMPLET`), so the two are joined by geometry or not at all |
+| `silver.neighborhood_streets` | The sides of the roadway, from Montreal's *géobase double* — one row per `COTE_RUE_ID`, already clipped to a borough by the pipeline. Lines, so `length_m` rather than `area_m2` |
+| `silver.lot_frontage` | How much of each lot's boundary faces each street side, in metres. Measured on `ST_Boundary(lot)` against a buffered street, not on the lot itself — `ST_Length` of a polygon is 0. `frontage_rank = 1` is the street a lot mostly fronts on |
+| `silver.vacancy_rates`, `silver.quartier_vacancy_rates`, `silver.average_rents`, `silver.quartier_average_rents` | One borough's CMHC Rental Market Survey, and the quartier rows each borough figure was averaged over. The average is unweighted — the survey publishes rates and nothing to weight them by — so `num_quartiers` travels on every row as the denominator it was actually taken over |
+| `silver.document_chunks` | The corpus before it is embedded: the text, the token count, and which map features cite it. Every scrape date, unlike `rag.chunks`, which is pruned to the current one |
+| `silver.zoning_grid_columns`, `silver.lot_zoning_envelopes` | What a *grille des usages et des normes* states, at the zone's grain and joined to the lots that zone covers. `solver_ready` says whether the parse survived contact with the solver |
+| `gold.lot_profiles` | Every lot in a borough at the grain a question is asked about — one row per parcel, carrying whether a building stands on it and how many, its primary and secondary street frontage, the document that governs it, the zoning envelopes that bound what may be built on it (`zoning_envelopes`), the borough's CMHC vacancy and rent grids (`vacancy_rates`, `average_rents`) and what it costs to build there (`construction_costs`, with the underground and integrated ground-level parking rates flattened into `underground_stall_cost_low/high_cad` and `above_grade_stall_cost_low/high_cad` — dollars per stall — and the configured condominium / apartment band into `condo_cost_low/high_cad_sqft`). The three joins above each hold one row per (lot × something); this is where they collapse onto the lot, alongside four more jsonb columns the dataplatform hands in from its geoparquet tree. Replaces an earlier `rag.vacant_lots`, which kept only the parcels it found nothing on and so could answer one question at the cost of hiding every other lot — `WHERE NOT has_building` is that selection now |
 | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot` | The joins from geometry to vectors |
-| `rag.lot_documents`, `rag.search_at_lot_number` | The same joins entered from a lot number rather than a point, off the precomputed `rag.lot_features` |
+| `rag.lot_documents`, `rag.search_at_lot_number` | The same joins entered from a lot number rather than a point, off the precomputed `silver.lot_features` |
+
+Every `silver.*` and `gold.*` table is filled by **hbu_dataplatform** through
+`urban_rag.warehouse`, which is their single writer; the three `rag.*` tables
+are filled by `urban_rag.postgis`, the same repo one layer down.
 
 The role, the schemas and the grants are [`sql/000_roles.sql`](sql/000_roles.sql).
 It sorts first, so `db-init` applies it ahead of everything else; `db-bootstrap`
@@ -122,9 +131,60 @@ applies it too and then sets the role's password, which is the one thing no
 cross-repo `--file` path and two half-bootstraps that each assumed the other
 had granted what it needed.
 
-Everything in `rag` ends up owned by `urban_rag` whichever order the steps run
-in: [`sql/002_spatial.sql`](sql/002_spatial.sql) hands over ownership if the
-role exists and emits a `NOTICE` if it does not.
+Everything in `rag`, `silver`, `gold` and `warehouse` ends up owned by
+`urban_rag` whichever order the steps run in: every file here hands ownership
+over at the end if the role exists, and emits a `NOTICE` if it does not.
+
+### How the silver and gold tables are shaped
+
+Every table in `silver` and `gold` is partitioned the same way, because every
+one of them holds the same thing — one borough's snapshot of one day:
+
+```
+<table>                        PARTITION BY LIST  (neighborhood)
+  <table>__vsmpe               PARTITION BY RANGE (scrape_date)
+    <table>__vsmpe__202608     one month of it
+```
+
+The borough set is small, closed and named, so LIST says exactly what it means
+and a borough's whole history is one subtree an operator can detach. The date
+axis is open and grows a row every day, so it is RANGE, by month.
+
+Postgres requires a partitioned table's unique constraint to contain its
+partition keys, which is not a tax here but the grain restated — and it is
+exactly what the pipeline's write conflicts on:
+
+```sql
+INSERT INTO silver.neighborhood_streets (...)
+VALUES (...)
+ON CONFLICT (scrape_date, neighborhood, cote_rue_id)
+DO UPDATE SET ...
+```
+
+A write is that upsert followed by a prune of the partition's rows the load did
+not produce. The upsert is what lets a re-run land while readers are querying —
+nothing is ever missing mid-load, the way a delete-then-insert leaves it — and
+the prune is what keeps snapshot semantics, which the upsert alone cannot: a lot
+that disappears from the cadastre has no row to conflict with.
+
+Partitions are created on demand by `warehouse.ensure_partition`, called with
+the (neighborhood, scrape_date) about to be written. Deliberately **not** a
+`DEFAULT` partition: rows that land in a default cannot be moved by attaching
+the partition they belong in, so a default that quietly catches a borough
+nobody declared is a table that has to be rewritten to repair.
+
+`make db-check` prints one row per leaf, under `partitions`.
+
+The `dagster` schema is the exception to the "this repo owns the DDL" rule
+above, and it is the same exception `rag.chunks` is: `hbu_dataplatform` points
+Dagster's run, event and schedule storage there, and Dagster creates and
+migrates those tables itself. What `000_roles.sql` does is make the schema
+exist and stay usable no matter which role connects first — the master user
+(`db.py env`) and `urban_rag` (`db.py env --app`) both create tables Dagster
+can go on using, because the file grants and sets default privileges in both
+directions. `db.py check` lists what has landed there; empty until the first
+Dagster start, and empty forever if the pipeline is left on the local SQLite
+default.
 
 ---
 
@@ -261,7 +321,7 @@ What only `db-bootstrap` does is set the role's password: until it has run,
 ```bash
 make db-ca                             # RDS root cert, for sslmode=verify-full
 make db-bootstrap ENV=dev TUNNEL=1     # urban_rag role + grants, password → Secrets Manager
-make db-init      ENV=dev TUNNEL=1     # extensions, rag/dagster schemas, spatial tables
+make db-init      ENV=dev TUNNEL=1     # extensions, the rag/silver/gold schemas and their tables
 make db-check     ENV=dev TUNNEL=1
 ```
 
@@ -670,7 +730,7 @@ defaults to medium for that reason.
 | [`alb.tf`](alb.tf) | The public load balancer, its security group, target group, and the 80/443 listeners `app_certificate_arn` switches between (`enable_app`) |
 | [`ecs.tf`](ecs.tf) | The Fargate cluster, task definition, service, task IAM roles, and the two application secrets |
 | [`outputs.tf`](outputs.tf) | Connection details, the app URL, and the ALB's DNS name and zone for a CNAME or alias record |
-| [`sql/`](sql/) | Extensions, spatial tables, the building x lot and lot x street joins, spatial search functions |
+| [`sql/`](sql/) | Extensions, the `rag` working set, the partitioned `silver`/`gold` tables and the function that creates their partitions, spatial search functions |
 | [`scripts/db.py`](scripts/db.py) | The CLI everything above is driven through |
 | [`scripts/tunnel.sh`](scripts/tunnel.sh) | Session Manager port forwarding |
 

@@ -505,22 +505,68 @@ def cmd_check(args) -> int:
         if missing:
             print(f"  {RED}not installed: {', '.join(missing)}{RESET} — run `db.py init`")
 
-        print(f"\n{BOLD}rag schema{RESET}")
-        cols, rows = _run(
-            conn,
-            """
-            SELECT c.relname AS object,
-                   CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ELSE c.relkind::text END AS kind,
-                   COALESCE(s.n_live_tup, 0) AS rows,
-                   pg_size_pretty(pg_total_relation_size(c.oid)) AS size
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-             WHERE n.nspname = 'rag' AND c.relkind IN ('r', 'v')
-             ORDER BY c.relkind, c.relname
-            """,
-        )
-        print(_table(cols, rows) if rows else f"  {DIM}empty — run `db.py init`{RESET}")
+        # One block per medallion schema, in the order data moves through them.
+        # `p` — a partitioned table — is listed as such rather than as a table:
+        # every silver/gold table is one, and its own row holds nothing, so
+        # seeing "0 rows" next to a partitioned parent should not read as a
+        # load that failed. The leaves are counted under `partitions` below.
+        for schema, source in (
+            ("rag", "the spatial working set and the corpus"),
+            ("silver", "one table per silver asset"),
+            ("gold", "one table per gold asset"),
+        ):
+            print(f"\n{BOLD}{schema} schema{RESET} {DIM}({source}){RESET}")
+            cols, rows = _run(
+                conn,
+                """
+                SELECT c.relname AS object,
+                       CASE c.relkind
+                            WHEN 'r' THEN 'table'
+                            WHEN 'p' THEN 'partitioned'
+                            WHEN 'v' THEN 'view'
+                            ELSE c.relkind::text END AS kind,
+                       COALESCE(s.n_live_tup, 0) AS rows,
+                       pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+                 WHERE n.nspname = %s
+                   AND c.relkind IN ('r', 'p', 'v')
+                   -- Leaves are listed by `partitions` below, at the grain
+                   -- they are actually managed at.
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid
+                   )
+                 ORDER BY c.relkind, c.relname
+                """,
+                (schema,),
+            )
+            print(
+                _table(cols, rows)
+                if rows
+                else f"  {DIM}empty — run `db.py init`{RESET}"
+            )
+
+        # What `warehouse.ensure_partition` has created so far: one row per
+        # (table, borough, month) that has ever been written. The read to run
+        # before detaching or dropping anything.
+        _, exists = _run(conn, "SELECT to_regclass('warehouse.partitions')")
+        if exists and exists[0][0] is not None:
+            print(f"\n{BOLD}partitions{RESET} {DIM}(silver + gold leaves){RESET}")
+            cols, rows = _run(
+                conn,
+                """
+                SELECT table_schema, table_name, partition, rows,
+                       pg_size_pretty(bytes) AS size
+                  FROM warehouse.partitions
+                """,
+            )
+            print(
+                _table(cols, rows)
+                if rows
+                else f"  {DIM}none yet — the pipeline creates one per borough-month "
+                f"on its first write{RESET}"
+            )
 
         print(f"\n{BOLD}dagster schema{RESET}")
         cols, rows = _run(
