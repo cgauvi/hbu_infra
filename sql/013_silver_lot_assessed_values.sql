@@ -2,10 +2,13 @@
 -- from Quebec's rôle d'évaluation foncière.
 --
 -- Infolot draws the lot and says nothing about its worth; the roll values the
--- property and draws no lot. Nothing published joins the two, so
--- hbu_dataplatform's `lot_assessed_values` asset computes it: each assessment
--- unit's point is placed in the lot it falls inside, and the units on a lot
--- are summed. See that repo's `urban_rag.role_assets`.
+-- property and draws no lot. hbu_dataplatform's `lot_assessed_values` asset
+-- joins them on the lot number the roll itself publishes (`b05v_lot_cadst`),
+-- falling back to the assessment unit's point for the units that crosswalk
+-- cannot place — which is every divided co-ownership, since those name their
+-- private lots and Infolot draws the common parts. `num_units_by_point` says
+-- how many of a lot's units came the second way. See that repo's
+-- `urban_rag.role_assets`.
 --
 -- `lot_number` is Infolot's own NO_LOT — "2 170 935" for a numbered lot,
 -- "PC-29987" for the common parts of a divided co-ownership — and is the
@@ -19,6 +22,16 @@
 -- NULL total, because a sum over nothing is not a value of zero, and a reader
 -- that averaged $0 across the borough's lanes would be answering a different
 -- question than the one it asked.
+--
+-- **There are two totals, and which one to use depends on the question.** A
+-- unit can cover several lots, and `total_assessed_value` counts its whole
+-- value on each of them: right for "what is the property on this lot worth",
+-- wrong to SUM() across a borough, where it over-counts — by $5.1B of $29.4B
+-- on the first VSMPE snapshot. `total_assessed_value_apportioned` divides each
+-- unit's value by the lots it covers, so that column adds up and the other
+-- does not. `num_shared_units` counts the units on this lot that are also on
+-- another, which is exactly where the two diverge; it is 0 for most lots, and
+-- the two totals are then equal.
 --
 -- `num_assessment_units` is not decoration. A divided-co-ownership building is
 -- one unit per apartment, all of them on the one PC-* common-parts lot: 402
@@ -45,10 +58,21 @@ CREATE TABLE IF NOT EXISTS silver.lot_assessed_values (
     neighborhood         text NOT NULL,
     -- NO_LOT in the published cadastre.
     lot_number           text NOT NULL,
-    -- Assessment units whose point falls inside this lot. 0 is a real answer.
+    -- Assessment units placed on this lot, by either route. 0 is a real answer.
     num_assessment_units integer NOT NULL DEFAULT 0,
-    -- Sum of rl0404a over those units. NULL when there are none — see above.
+    -- Of those, the ones that also sit on another lot — the ones whose value
+    -- is counted here and elsewhere. Where the two totals below diverge.
+    num_shared_units     integer NOT NULL DEFAULT 0,
+    -- Of those, the ones placed by their point because the roll's lot-number
+    -- crosswalk could not place them. On a condominium's PC-* lot this is all
+    -- of them; on an ordinary lot it is normally 0.
+    num_units_by_point   integer NOT NULL DEFAULT 0,
+    -- Sum of rl0404a over those units, each counted whole. NULL when there are
+    -- none. Do not SUM() this across lots — see the header.
     total_assessed_value numeric,
+    -- The same, with each unit's value divided by the lots it covers. This is
+    -- the one that adds up across lots.
+    total_assessed_value_apportioned numeric,
     -- Fiscal year of the roll the values came from, not the scrape date.
     roll_year            integer,
     attributes           jsonb NOT NULL DEFAULT '{}'::jsonb,

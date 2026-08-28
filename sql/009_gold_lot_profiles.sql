@@ -24,6 +24,16 @@
 --   silver.lot_frontage               → primary_* and secondary_*, num_frontages
 --   rag.lot_documents                 → doc_* and documents
 --
+-- A fourth arrives from a table too, and is the one exception to the shape:
+--
+--   silver.lot_assessed_values        → total_assessed_value and its counts
+--
+-- That one is already one row per lot, so it is a plain LEFT JOIN rather than
+-- a grouped CTE. It is what makes this table answer the whole of the
+-- highest-and-best-use question rather than half of it — what the ground is
+-- worth as it stands, against what the cost columns below say it would take to
+-- build on it.
+--
 -- Four more arrive as jsonb, handed in by the asset from the geoparquet tree
 -- rather than read out of a table, because none of them is loaded into
 -- Postgres at the grain this one needs:
@@ -171,6 +181,63 @@ CREATE TABLE IF NOT EXISTS gold.lot_profiles (
     num_zoning_envelopes integer NOT NULL DEFAULT 0,
     zoning_envelopes jsonb NOT NULL DEFAULT '[]'::jsonb,
 
+    -- -- what the ground on it is assessed at ------------------------------
+    --
+    -- silver.lot_assessed_values, carried onto the profile. Alone among this
+    -- table's joined inputs it already holds one row per lot — its own primary
+    -- key is (scrape_date, neighborhood, lot_number) — so it arrives by a
+    -- plain LEFT JOIN on lot_number rather than a grouped CTE, and cannot fan
+    -- the row out. Joined on lot_number and not lot_uid for the reason the
+    -- envelopes are: lot_uid is a bigserial load_lots mints again on every
+    -- reload, and the assessment table does not carry one at all.
+    --
+    -- Quebec's rôle d'évaluation foncière values the property and draws no
+    -- lot; Infolot draws the lot and says nothing about its worth. That asset
+    -- is the join nobody publishes, and this is the column a
+    -- highest-and-best-use question actually asks for: what the ground is
+    -- worth standing as it is, next to what it would cost to build on it.
+    --
+    -- Assessment units standing on the lot. 0 is a real answer — a lane, a
+    -- park, a city parcel — and it is why the total below is nullable. Not
+    -- decoration either: a divided-co-ownership building is one unit per
+    -- apartment, all of them on the one PC-* common-parts lot, and the first
+    -- VSMPE snapshot has 402 units and $258M on a single parcel. The total
+    -- only means what a reader thinks it means with the count beside it.
+    num_assessment_units integer NOT NULL DEFAULT 0,
+    -- Of those, the ones standing on another lot too — whose whole value is
+    -- counted here *and* there. Exactly where the two totals below diverge; 0
+    -- for most lots, and the two are then equal.
+    num_shared_units integer NOT NULL DEFAULT 0,
+    -- Of those, the ones placed by where their assessment point falls because
+    -- the roll's own lot-number crosswalk could not place them. On a
+    -- condominium's PC-* lot this is all of them — the roll names the private
+    -- lots, Infolot draws the common parts — and on an ordinary lot it is 0.
+    -- Carried so a total can be read back against the route that produced it,
+    -- the same rule max_built_area_m2 and frontage_buffer_m follow.
+    num_units_by_point integer NOT NULL DEFAULT 0,
+    -- Sum of rl0404a (VALEUR IMMEUBLE: land plus buildings, on the roll in
+    -- force) over those units, each counted whole. **NULL, not 0, when there
+    -- are none** — the same rule primary_frontage_m follows. A sum over
+    -- nothing is not a value of zero, and a reader averaging $0 across the
+    -- borough's lanes would be answering a question it did not ask.
+    --
+    -- Right for "what is the property on this lot worth", wrong to SUM()
+    -- across a borough: a unit spanning several lots is counted whole on each
+    -- of them, by $5.1B of $29.4B on the first VSMPE snapshot. Use the
+    -- apportioned column for that one.
+    --
+    -- numeric rather than double precision, as in 013: these are dollars
+    -- summed over hundreds of rows and a borough's roll runs to $27 billion.
+    total_assessed_value numeric,
+    -- The same, with each unit's value divided across the lots it covers, so
+    -- this is the column that adds up across lots and the one above is not.
+    total_assessed_value_apportioned numeric,
+    -- Fiscal year of the roll the values came from, not the scrape date. The
+    -- roll is triennial and this table's date axis is the cadastre's: two
+    -- scrape dates three months apart carry the same roll, two a year apart
+    -- may not, and nothing else in the row would say so.
+    roll_year integer,
+
     -- -- what the rental market around it looks like -----------------------
     --
     -- CMHC surveys neighborhoods, not parcels, so these two are the
@@ -269,6 +336,18 @@ CREATE TABLE IF NOT EXISTS gold.lot_profiles (
 -- the indexes, in case one of them is on a column it adds.
 -- ---------------------------------------------------------------------------
 
+-- silver.lot_assessed_values, joined on lot_number. The counts default to 0
+-- and the two totals stay NULL, which is the same distinction the CREATE TABLE
+-- above draws and the truth about a row until its partition is recomputed: no
+-- unit has been placed on it *yet*, as against a lot carrying none.
+ALTER TABLE gold.lot_profiles
+    ADD COLUMN IF NOT EXISTS num_assessment_units integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS num_shared_units integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS num_units_by_point integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_assessed_value numeric,
+    ADD COLUMN IF NOT EXISTS total_assessed_value_apportioned numeric,
+    ADD COLUMN IF NOT EXISTS roll_year integer;
+
 -- Created on the parent, so every partition warehouse.ensure_partition adds
 -- gets them without anyone remembering to. The (neighborhood, scrape_date)
 -- index the old table needed is gone: that filter is now partition pruning.
@@ -291,6 +370,13 @@ CREATE INDEX IF NOT EXISTS lot_profiles_documents_idx
 -- documents index serves.
 CREATE INDEX IF NOT EXISTS lot_profiles_envelopes_idx
     ON gold.lot_profiles USING gin (zoning_envelopes);
+-- "The most valuable ground in this borough", which is the read the assessment
+-- lineage exists for. Partial for the reason 013's twin is: a NULL total is
+-- the *other* question — the lots carrying no assessed property at all — and a
+-- full index would carry every lane in the borough to answer neither.
+CREATE INDEX IF NOT EXISTS lot_profiles_assessed_idx
+    ON gold.lot_profiles (total_assessed_value DESC)
+    WHERE total_assessed_value IS NOT NULL;
 
 DO $$
 DECLARE

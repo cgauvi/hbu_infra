@@ -25,14 +25,31 @@
 -- in PostGIS: every row would report no frontage at all. Frontage is a length
 -- along the parcel's edge, so the left-hand side has to be the boundary.
 --
--- Second, `buffer_m`. A lot line does not sit on the curb line — there is a
--- sidewalk between them, and the city publishes the géobase "à titre
--- indicatif" rather than to survey accuracy — so the street side is buffered
--- before the boundary is clipped to it. Widening that buffer costs accuracy at
--- the corners: the first `buffer_m` of each *side* boundary falls inside it
--- too and is counted as frontage. The value used is written onto every row so
--- a table can always be read back against its own cutoff, the same way
--- gold.lot_profiles.max_built_area_m2 carries its threshold.
+-- Second, `buffer_m` — which is a *reach*, not a buffer, and rows written
+-- before 2026-08 mean something else by it. It used to be exactly that: the
+-- street side was buffered and the lot boundary clipped to the result. That
+-- measure could not be made to work at any setting. A lot line does not sit on
+-- the curb line — the géobase double is drawn along the roadway, the city
+-- publishes it "à titre indicatif", and the median lot line in VSMPE sits
+-- 4.85 m behind it — so at the 3 m the pipeline defaulted to, 22 545 of that
+-- borough's 24 952 lots (90 %) had no row here at all. Widening
+-- the buffer to reach them inflated everything it did reach: a lot's two side
+-- boundaries run at the street, their first `buffer_m` falls inside the buffer
+-- too, and every lot gained two metres of frontage it does not have per metre
+-- of buffer. Lot 3 790 556, whose street edge measures 15.24 m, was reported
+-- as 16.3 m at a 4 m buffer and 32.3 m at 12 m.
+--
+-- What is measured now is the lot boundary that runs *along* a street side:
+-- the boundary is chopped into ~1 m pieces, each piece is matched to the
+-- single nearest side within `buffer_m`, and a piece counts only if it runs
+-- within 45° of parallel to that side. The result no longer moves with
+-- `buffer_m` — the same lot measures 15.24 m at 6, 8, 10 and 12 — so the value
+-- is free to be wide enough to reach the lots, and defaults to 10 m.
+--
+-- `buffer_m` still decides which lots got a row at all, so it is still written
+-- onto every row, the same way gold.lot_profiles.max_built_area_m2 carries its
+-- threshold. A table whose rows say 3.0 was measured the old way and is
+-- missing most of its borough.
 --
 -- `frontage_rank` is 1 for the longest frontage a lot has, and is the column to
 -- filter on when a question wants *the* street a lot fronts on rather than
@@ -77,9 +94,11 @@ CREATE TABLE IF NOT EXISTS silver.lot_frontage (
     -- 1 for this lot's longest frontage, 2 for its next, ...
     frontage_rank    integer NOT NULL,
     -- The facing stretch of boundary itself, not the whole lot edge and not
-    -- the street. Left as a bare Geometry rather than typed MultiLineString:
-    -- ST_CollectionExtract returns a MultiLineString, but a future clip that
-    -- keeps more than linework should not need a migration to land.
+    -- the street — the pieces that were counted, merged back into as few
+    -- linestrings as they allow, so ST_Length of this is frontage_m. Left as a
+    -- bare Geometry rather than typed MultiLineString: ST_LineMerge returns a
+    -- LineString for a lot whose frontage is one contiguous run and a
+    -- MultiLineString for one that meets the same side twice.
     geom             geometry(Geometry, 4326),
     loaded_at        timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scrape_date, neighborhood, lot_uid, cote_rue_id)
