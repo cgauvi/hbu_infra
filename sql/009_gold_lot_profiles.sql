@@ -34,7 +34,18 @@
 -- worth as it stands, against what the cost columns below say it would take to
 -- build on it.
 --
--- A fifth is one row per (lot, zone, column) like the envelopes, and is
+-- A fifth arrives the same way and at the same grain, and is what turns the
+-- fourth from a number into an answer:
+--
+--   silver.lot_assessment_comparables → cap_rate_pct, estimated_value_cad,
+--                                       assessed_to_estimated_ratio, comparables
+--
+-- That one says what the property standing on the lot *earns* on what it is
+-- assessed at, and what the k most similar lots in the borough imply the ground
+-- is actually worth. Also a plain LEFT JOIN, and also on lot_number, for the
+-- reasons the fourth is. See sql/016.
+--
+-- A sixth is one row per (lot, zone, column) like the envelopes, and is
 -- narrowed to one rather than grouped:
 --
 --   silver.lot_buildable_setbacks     → buildable_area_m2, footprint_cap_m2
@@ -401,6 +412,74 @@ ALTER TABLE gold.lot_profiles
     ADD COLUMN IF NOT EXISTS footprint_cap_binding text,
     ADD COLUMN IF NOT EXISTS side_setback_rule text;
 
+-- silver.lot_assessment_comparables (sql/016), joined on lot_number like the
+-- assessment totals above and by a plain LEFT JOIN for the same reason: that
+-- table is already one row per lot, so there is nothing to group and the join
+-- cannot fan a profile out.
+--
+-- This is the half of a highest-and-best-use question the columns above only
+-- set up. `total_assessed_value` says what the ground is worth as it stands and
+-- `footprint_cap_m2` says how much may be built on it; these say what the thing
+-- standing there *earns*, and what the lots around it suggest the ground is
+-- actually worth. The screen the whole lineage is for is one predicate over
+-- two of them —
+--
+--     SELECT lot_number, assessed_to_estimated_ratio, footprint_cap_m2
+--       FROM gold.lot_profiles
+--      WHERE assessed_to_estimated_ratio < 0.7
+--        AND buildable_area_m2 > built_area_m2
+--      ORDER BY assessed_to_estimated_ratio
+--
+-- — a parcel the roll values below what its own neighbours imply, with room
+-- left under its zoning to do something about it.
+--
+-- No default on any of these except the two counts and the two jsonb objects,
+-- and that split is the one the columns above already draw: "this partition
+-- has not been recomputed yet" and "this lot earns nothing" are different
+-- answers, and NULL is the first of them. A lane really does have no cap rate.
+--
+-- num_dwellings is nullable for the same reason and is NOT the negation of
+-- zero: a lot no assessment unit stands on has no dwelling count, and one
+-- carrying a warehouse has a count of 0.
+ALTER TABLE gold.lot_profiles
+    ADD COLUMN IF NOT EXISTS num_dwellings integer,
+    ADD COLUMN IF NOT EXISTS floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS residential_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS commercial_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS industrial_floor_area_m2 double precision,
+    -- The use code of the unit carrying most of the lot's value. Text, because
+    -- rl0105a is a classification whose leading digit is its category.
+    ADD COLUMN IF NOT EXISTS dominant_use_code text,
+    ADD COLUMN IF NOT EXISTS year_built integer,
+    -- Annual, gross of the operating expense ratio and net of each class's own
+    -- vacancy. Null where no class could be priced, which for a borough CMHC
+    -- suppressed is every purely residential lot in it.
+    ADD COLUMN IF NOT EXISTS gross_income_cad double precision,
+    ADD COLUMN IF NOT EXISTS net_operating_income_cad double precision,
+    -- In percent, as a cap rate is quoted and as overall_vacancy_rate_pct
+    -- beside it is stored. The first is the yield on the assessed value, the
+    -- second on what the comparables imply, and they differ by exactly
+    -- assessed_to_estimated_ratio.
+    ADD COLUMN IF NOT EXISTS cap_rate_pct double precision,
+    ADD COLUMN IF NOT EXISTS comparable_cap_rate_pct double precision,
+    -- Every stated assumption behind those two — the rent and vacancy that were
+    -- surveyed, the expense ratio, the two per-square-foot rates, the market
+    -- value factor. A rate with no assumptions beside it cannot be read against
+    -- next quarter's, which is the rule construction_costs already follows.
+    ADD COLUMN IF NOT EXISTS income_assumptions jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- The median comparable ratio applied back to this lot, and which ratio it
+    -- was: 'per_dwelling', 'per_floor_area', 'per_land_area' or 'none'.
+    ADD COLUMN IF NOT EXISTS estimated_value_cad numeric,
+    ADD COLUMN IF NOT EXISTS estimated_value_basis text,
+    ADD COLUMN IF NOT EXISTS assessed_to_estimated_ratio double precision,
+    ADD COLUMN IF NOT EXISTS num_comparables integer NOT NULL DEFAULT 0,
+    -- The k most similar lots, with the metric that chose them: {k,
+    -- max_distance_m, num_candidates, scales, penalties, weights, neighbors}.
+    -- The metric travels with the list because a neighbour list means nothing
+    -- without it. '{}' is a partition whose silver asset has not run; an object
+    -- whose `neighbors` is empty is a lot with nothing inside the radius.
+    ADD COLUMN IF NOT EXISTS comparables jsonb NOT NULL DEFAULT '{}'::jsonb;
+
 -- Created on the parent, so every partition warehouse.ensure_partition adds
 -- gets them without anyone remembering to. The (neighborhood, scrape_date)
 -- index the old table needed is gone: that filter is now partition pruning.
@@ -437,6 +516,19 @@ CREATE INDEX IF NOT EXISTS lot_profiles_assessed_idx
 CREATE INDEX IF NOT EXISTS lot_profiles_buildable_idx
     ON gold.lot_profiles (footprint_cap_m2 DESC)
     WHERE footprint_cap_m2 IS NOT NULL;
+-- "The parcels the roll values furthest below what their neighbours imply",
+-- which is where a highest-and-best-use screen starts. ASC, unlike every
+-- partial index above it: here the interesting end is the low one. Partial for
+-- the same reason as the rest — a NULL is a lot with no comparable to be
+-- measured against, which is the other question.
+CREATE INDEX IF NOT EXISTS lot_profiles_underassessed_idx
+    ON gold.lot_profiles (assessed_to_estimated_ratio)
+    WHERE assessed_to_estimated_ratio IS NOT NULL;
+-- "The best-yielding ground in this borough", the other read sql/016 exists
+-- for, carried onto the profile so it can be filtered by everything else here.
+CREATE INDEX IF NOT EXISTS lot_profiles_cap_rate_idx
+    ON gold.lot_profiles (cap_rate_pct DESC)
+    WHERE cap_rate_pct IS NOT NULL;
 
 DO $$
 DECLARE
