@@ -34,6 +34,18 @@
 -- worth as it stands, against what the cost columns below say it would take to
 -- build on it.
 --
+-- A fifth is one row per (lot, zone, column) like the envelopes, and is
+-- narrowed to one rather than grouped:
+--
+--   silver.lot_buildable_setbacks     → buildable_area_m2, footprint_cap_m2
+--
+-- The row taken is the one governing the lot — the grid column
+-- select_residential_column chose, and failing that the zone covering most of
+-- the parcel. The per-column figures are not lost: the same table is merged
+-- into each entry of `zoning_envelopes` below, so a reader solving one
+-- candidate has the buildable area for *that* candidate rather than for the
+-- lot's governing one. See sql/015.
+--
 -- Four more arrive as jsonb, handed in by the asset from the geoparquet tree
 -- rather than read out of a table, because none of them is loaded into
 -- Postgres at the grain this one needs:
@@ -180,6 +192,36 @@ CREATE TABLE IF NOT EXISTS gold.lot_profiles (
     -- of its own the way doc_url is.
     num_zoning_envelopes integer NOT NULL DEFAULT 0,
     zoning_envelopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+
+    -- -- and how much of it may actually be built on -----------------------
+    --
+    -- silver.lot_buildable_setbacks (sql/015), taken at the row that governs
+    -- the lot — the column select_residential_column chose, and failing that
+    -- the zone covering most of the parcel. The margins the zoning grid states
+    -- have been carried on the envelope since sql/012 without anything
+    -- subtracting them; these are what is left of the lot once they are.
+    --
+    -- NULL, not 0, where nothing was computed — a lot whose zone published no
+    -- readable grid, and a lot with no frontage row to call a front edge, were
+    -- both not measured rather than measured at nothing. The same rule
+    -- primary_frontage_m follows. A buildable area *of* 0 is a real answer and
+    -- does appear: a parcel narrower than twice its side margin has nowhere to
+    -- put a building.
+    buildable_area_m2    double precision,
+    buildable_pct_of_lot double precision,
+    -- The footprint a building may actually take: the lesser of the buildable
+    -- envelope above and *Taux d'implantation au sol max* × lot_area_m2. Two
+    -- independent caps — the margins say where on the lot, the coverage says
+    -- how much of it — and a building satisfies both.
+    footprint_cap_m2 double precision,
+    -- Which of the two bound: 'setbacks' or 'site_coverage'. The column that
+    -- says whether this borough is shaped by its margins or by its coverage.
+    footprint_cap_binding text,
+    -- Which reading of *Mode d'implantation* the side setback was computed
+    -- under: 'contigu' (party lines both sides, side setback 0), 'jumele'
+    -- (one), 'isole' (neither), or 'unknown'. Carried because it changes the
+    -- number above more than any single margin does — see sql/015.
+    side_setback_rule text,
 
     -- -- what the ground on it is assessed at ------------------------------
     --
@@ -348,6 +390,17 @@ ALTER TABLE gold.lot_profiles
     ADD COLUMN IF NOT EXISTS total_assessed_value_apportioned numeric,
     ADD COLUMN IF NOT EXISTS roll_year integer;
 
+-- silver.lot_buildable_setbacks (sql/015), at the row governing each lot. No
+-- default on any of the five: unlike the counts above, "nothing has been
+-- computed for this row yet" and "this lot has no buildable area" are
+-- different answers, and NULL is the first of them. See the column comments.
+ALTER TABLE gold.lot_profiles
+    ADD COLUMN IF NOT EXISTS buildable_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS buildable_pct_of_lot double precision,
+    ADD COLUMN IF NOT EXISTS footprint_cap_m2 double precision,
+    ADD COLUMN IF NOT EXISTS footprint_cap_binding text,
+    ADD COLUMN IF NOT EXISTS side_setback_rule text;
+
 -- Created on the parent, so every partition warehouse.ensure_partition adds
 -- gets them without anyone remembering to. The (neighborhood, scrape_date)
 -- index the old table needed is gone: that filter is now partition pruning.
@@ -377,6 +430,13 @@ CREATE INDEX IF NOT EXISTS lot_profiles_envelopes_idx
 CREATE INDEX IF NOT EXISTS lot_profiles_assessed_idx
     ON gold.lot_profiles (total_assessed_value DESC)
     WHERE total_assessed_value IS NOT NULL;
+-- "The parcels with the most room to build on them", which is the read the
+-- setback lineage exists for. Partial for the reason the assessment index
+-- above is: a NULL is the *other* question — the lots nothing could be
+-- computed for — and carrying every one of them here would answer neither.
+CREATE INDEX IF NOT EXISTS lot_profiles_buildable_idx
+    ON gold.lot_profiles (footprint_cap_m2 DESC)
+    WHERE footprint_cap_m2 IS NOT NULL;
 
 DO $$
 DECLARE
