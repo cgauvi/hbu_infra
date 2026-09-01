@@ -189,6 +189,20 @@ CREATE INDEX IF NOT EXISTS lot_highest_best_use_dominant_use_idx
     ON gold.lot_highest_best_use (hbu_dominant_use)
     WHERE solved;
 
+-- What stands on each storey of the chosen program — silver.
+-- lot_development_programs' own column (sql/017), restated on the winning row
+-- like every money and mix column above it. That header is where the shape of
+-- an entry is, and where the order the uses are stacked in is written down as
+-- the reporting convention it is rather than something the solver decided.
+--
+-- Nullable here and NOT NULL there, and the difference is this table's whole
+-- posture: a lot whose every envelope authorises commerce keeps its row and
+-- has no program at all, and an empty array would read as "a building with no
+-- storeys" where the honest value is "no building was chosen". hbu_status
+-- says which of the two a null is.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS floor_stack jsonb;
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';

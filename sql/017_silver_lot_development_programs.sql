@@ -244,6 +244,54 @@ CREATE INDEX IF NOT EXISTS lot_development_programs_npv_idx
     ON silver.lot_development_programs (npv_cad DESC)
     WHERE solved;
 
+-- What stands on each storey, added when the question after "nine storeys and
+-- forty dwellings" turned out to be "on which floor". A jsonb array of runs of
+-- identical levels rather than one entry per level — the model builds one
+-- plate and repeats it, so a fifteen-storey tower over retail and a parking
+-- deck is four entries and not fifteen. Written by hbu_dataplatform's
+-- `urban_rag.program.floor_stack`, which is also where the order the uses are
+-- stacked in is written down as the reporting convention it is: the *Niveaux
+-- de bâtiment autorisés* block is marked per column and not per usage, so the
+-- solver counts storeys by type and never places one. Every number here is a
+-- column above it re-cut by level; changing the order changes a drawing and
+-- never an answer.
+--
+-- Entries run bottom upwards and all carry the same keys, so unnesting one
+-- needs no branch on the use:
+--
+--   use                    parking | commercial | industrial | residential
+--   position               above_grade | below_grade
+--   from_level, to_level   inclusive; 1 is the rez-de-chaussée and the dug
+--                          levels are -1 downwards. There is no level 0
+--   floors                 levels the run spans
+--   floor_plate_m2         the footprint, which every storey shares
+--   floor_area_m2          floor_plate_m2 × floors
+--   counts_as_floor_area   false below grade — article 38 1° of 01-283 keeps
+--                          a dug level out of the superficie de plancher
+--   storey_height_m        by use, and 0 below grade: height is measured from
+--                          grade up, so a dug level stands no metres
+--   height_m               storey_height_m × floors
+--   stalls                 0 off a parking run
+--   dwellings, units       0 and {} off the residential run. The mix sits on
+--                          that run whole rather than divided by its storeys —
+--                          the solver chose a mix for the building and not for
+--                          a plate, and splitting it would invent the part it
+--                          did not choose
+--
+-- "Every program that puts commerce at grade", which is the read the column
+-- exists for:
+--
+--   SELECT lot_uid
+--     FROM silver.lot_development_programs,
+--          LATERAL jsonb_array_elements(floor_stack) AS storey
+--    WHERE storey->>'use' = 'commercial'
+--      AND (storey->>'from_level')::int = 1;
+--
+-- NOT NULL like binding beside it: every row of this table carries a program
+-- row, solved or not, and an unsolved one stacks nothing.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS floor_stack jsonb NOT NULL DEFAULT '[]'::jsonb;
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';
