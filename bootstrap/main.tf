@@ -258,6 +258,18 @@ data "aws_iam_policy_document" "hbu_github_deploy" {
     resources = ["*"]
   }
 
+  # The deploy workflow's pre-flight step calls describe-clusters before it
+  # builds anything. Omitting this granted nothing the deploy strictly needed —
+  # every later step addresses the cluster only through the service ARN — but
+  # the resulting AccessDenied surfaced as a cluster that does not exist, on a
+  # dev environment that was fully applied.
+  statement {
+    sid       = "ECSClusterDescribe"
+    effect    = "Allow"
+    actions   = ["ecs:DescribeClusters"]
+    resources = ["arn:aws:ecs:*:${data.aws_caller_identity.current.account_id}:cluster/hbu-*"]
+  }
+
   statement {
     sid    = "ECSService"
     effect = "Allow"
