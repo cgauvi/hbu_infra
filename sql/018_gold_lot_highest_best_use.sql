@@ -8,46 +8,55 @@
 -- that repo's `urban_rag.hbu.select_highest_best_use`.
 --
 -- **What "governing" means, and what it is not.** A lot can carry several
--- envelope rows for two unrelated reasons, and only one of them is a choice.
--- Within one zone, a grid authorises dwellings in more than one column and
--- distinguishes them by *Largeur du terrain min* — the column a parcel of
--- this width is written for is `select_residential_column`'s pick, carried
--- through as `governs_residential` on sql/012 and sql/017. Across zones, a lot
--- on a boundary picks up a sliver of its neighbour's zoning because two
--- publishers drew two lines — that is a mapping disagreement, not two sets of
--- rules the owner may choose between, and `pct_of_lot` is what says which line
--- is believed. So the governing row is: among the columns
--- `governs_residential` marks, the one whose zone covers most of the lot,
--- income breaking a tie between two zones covering it equally and the column
--- index breaking a tie after that.
+-- envelope rows for three reasons, and only one of them is anybody's choice.
+-- Within one zone and one usage family, a grid authorises the family in more
+-- than one column and distinguishes them by *Largeur du terrain min* — the
+-- column a parcel of this width is written for is `select_governing_column`'s
+-- pick, carried through as `governs_residential` / `governs_commercial` /
+-- `governs_industrial` on sql/012 and sql/017. Across zones, a lot on a
+-- boundary picks up a sliver of its neighbour's zoning because two publishers
+-- drew two lines — that is a mapping disagreement, not two sets of rules the
+-- owner may choose between, and `pct_of_lot` is what says which line is
+-- believed.
 --
--- **This table does not maximise anything.** The maximisation is inside
--- `solve_program`, over the mix a chosen envelope can hold — what is chosen
--- *here* is only which envelope, and the grid chooses it. Picking the
--- highest-earning column instead of the governing one would report a building
--- under rules the parcel may not be built to; every candidate that lost is
--- still in silver.lot_development_programs, which is where "why not the other
--- column" is answered.
+-- **Across families the choice is real, and it is priced.** A zone writing an
+-- H.2 column and a C.4 column beside it authorises either building, and which
+-- to put up is exactly the highest-and-best-use question. The chosen row is:
+-- among the governing columns of the zone covering most of the lot, the
+-- program worth the most discounted net profit (`npv_cad`), column index
+-- breaking a tie. The maximisation over the *mix* is still inside
+-- `solve_program`; what is maximised here is which governing envelope — the
+-- developer's use decision. Picking a non-governing column of the same family
+-- would still report a building under rules the parcel may not be built to,
+-- and is still never done; every candidate that lost keeps its row in
+-- silver.lot_development_programs, which is where "why not the other column"
+-- is answered. `hbu_dominant_use` says in one word what kind of building won:
+-- residential, commercial, industrial, mixed, or none.
 --
 -- **Every lot the envelopes reach keeps a row.** A lot whose every column
 -- authorises commerce and not housing has no program at all, and `hbu_status`
 -- says why rather than leaving a null row to be misread as a gap in the data:
 --
---   solved                  a governing envelope was solved
---   no_residential_column   every envelope on this lot authorises something
---                           other than housing — solve_program refuses such a
---                           column by design, and a pure C or I zone is where
---                           this shows
---   no_governing_column     residential columns exist and none governs —
---                           almost always a lot with no measured frontage
---                           under a grid stating a width minimum, which reads
---                           as 0 m and qualifies for nothing
---   infeasible              the governing column was solved and has no
---                           feasible program — a minimum the parcel cannot
---                           meet, or stalls it has nowhere to put
---   solver_error            the governing column could not be turned into a
---                           model at all; see the program row's own
---                           solve_error on sql/017
+--   solved                a governing envelope was solved
+--   no_candidate_column   every envelope on this lot authorises none of the
+--                         usages the solver prices — Habitation, Commerce or
+--                         Industrie. Équipements collectifs is deliberately
+--                         not a proforma; pure C and I zones solve like
+--                         everything else now and no longer land here
+--   no_governing_column   candidate columns exist and none governs — almost
+--                         always a lot with no measured frontage under a
+--                         grid stating a width minimum, which reads as 0 m
+--                         and qualifies for nothing
+--   infeasible            a governing column was solved and none has a
+--                         feasible program — a minimum the parcel cannot
+--                         meet, or stalls it has nowhere to put
+--   solver_error          a governing column could not be turned into a
+--                         model at all; see the program row's own
+--                         solve_error on sql/017
+--
+-- (`no_residential_column` is this table's former name for the first of
+-- those, from when the solver priced dwellings alone; rows written before
+-- the rename keep it until their partition is re-materialized.)
 --
 -- The money and mix columns below are silver.lot_development_programs' own,
 -- restated on the chosen row — see that table's header for what each one
@@ -156,6 +165,29 @@ CREATE INDEX IF NOT EXISTS lot_highest_best_use_noi_idx
 CREATE INDEX IF NOT EXISTS lot_highest_best_use_boundary_idx
     ON gold.lot_highest_best_use (lot_uid)
     WHERE num_zones > 1;
+
+-- The discounted objective, the family flags and the one-word verdict —
+-- added with the solver's move to discounted net profit; see sql/017's own
+-- ALTER block for what the money columns mean.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS npv_cad double precision,
+    ADD COLUMN IF NOT EXISTS present_value_cad double precision,
+    ADD COLUMN IF NOT EXISTS annual_stabilised_noi_cad double precision,
+    ADD COLUMN IF NOT EXISTS permits_residential boolean,
+    ADD COLUMN IF NOT EXISTS governs_residential boolean,
+    ADD COLUMN IF NOT EXISTS governs_commercial boolean,
+    ADD COLUMN IF NOT EXISTS governs_industrial boolean,
+    ADD COLUMN IF NOT EXISTS hbu_dominant_use text;
+
+-- "The most valuable lots in the borough", on the unit the choice was made in.
+CREATE INDEX IF NOT EXISTS lot_highest_best_use_npv_idx
+    ON gold.lot_highest_best_use (npv_cad DESC)
+    WHERE solved;
+-- "Every lot whose highest use is commerce (or industry, or mixed)" — the
+-- read the dominant-use word exists for.
+CREATE INDEX IF NOT EXISTS lot_highest_best_use_dominant_use_idx
+    ON gold.lot_highest_best_use (hbu_dominant_use)
+    WHERE solved;
 
 DO $$
 DECLARE

@@ -48,6 +48,12 @@ CREATE INDEX IF NOT EXISTS features_attrs_idx ON rag.features USING gin (attribu
 CREATE INDEX IF NOT EXISTS features_partition_idx
     ON rag.features (neighborhood, scrape_date);
 
+-- The zoning layer is one `source_table` out of two dozen, and the map asks
+-- for it by name on every tile. Leading with the column that is always an
+-- equality, so the index answers the layer *and* the partition in one probe.
+CREATE INDEX IF NOT EXISTS features_source_partition_idx
+    ON rag.features (source_table, neighborhood, scrape_date);
+
 -- ---------------------------------------------------------------------------
 -- Lots — cadastral parcels from Infolot
 --
@@ -68,6 +74,14 @@ CREATE TABLE IF NOT EXISTS rag.lots (
 
 CREATE INDEX IF NOT EXISTS lots_geom_idx ON rag.lots USING gist (geom);
 CREATE INDEX IF NOT EXISTS lots_number_idx ON rag.lots (lot_number);
+
+-- The partition, which `rag.buildings` and `rag.features` have always had and
+-- this table did not. It matters more here than on either of them: the map
+-- reads the cadastre a tile at a time and filters every one of them by borough
+-- and snapshot, so this is the difference between narrowing an already-small
+-- candidate set and re-filtering it row by row — several dozen times per pan.
+CREATE INDEX IF NOT EXISTS lots_partition_idx
+    ON rag.lots (neighborhood, scrape_date);
 
 -- ---------------------------------------------------------------------------
 -- Buildings — footprints from StatCan's Open Database of Buildings (BDOI)

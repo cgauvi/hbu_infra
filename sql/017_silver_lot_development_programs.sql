@@ -219,6 +219,31 @@ CREATE INDEX IF NOT EXISTS lot_development_programs_status_idx
     ON silver.lot_development_programs (status)
     WHERE status NOT IN ('OPTIMAL', 'INFEASIBLE');
 
+-- The discounted objective and the family flags, added when the solver
+-- stopped maximising a monthly NOI and started maximising discounted net
+-- profit over every priced usage family — see hbu_dataplatform's
+-- `urban_rag.program.InvestmentAssumptions`. `npv_cad` is the objective: the
+-- stabilised NOI discounted over the hold plus the discounted sale, less the
+-- capital. `present_value_cad` is that value before the capital comes off,
+-- and `annual_stabilised_noi_cad` the income figure the discounting was
+-- applied to. The monthly columns above survive unchanged, restated from the
+-- chosen program rather than maximised. The governs_* pair beside
+-- governs_residential carries which column rules each family for this lot,
+-- and permits_residential completes the permits trio for a table that now
+-- holds pure C and I candidates too.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS npv_cad double precision,
+    ADD COLUMN IF NOT EXISTS present_value_cad double precision,
+    ADD COLUMN IF NOT EXISTS annual_stabilised_noi_cad double precision,
+    ADD COLUMN IF NOT EXISTS permits_residential boolean,
+    ADD COLUMN IF NOT EXISTS governs_commercial boolean,
+    ADD COLUMN IF NOT EXISTS governs_industrial boolean;
+
+-- "The most valuable programs in the borough", on the objective's own unit.
+CREATE INDEX IF NOT EXISTS lot_development_programs_npv_idx
+    ON silver.lot_development_programs (npv_cad DESC)
+    WHERE solved;
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';

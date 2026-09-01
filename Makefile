@@ -75,22 +75,48 @@ endif
 # than a bad error message: ACCOUNT_ID below is a $(shell ...), so the failure
 # leaves BUCKET pointing at hbu-tf-state- and terraform init fails on that
 # instead. Hand them the system bundle, which is a superset of the public roots,
-# so this is a no-op where no proxy is in the way. Empty on Windows, whose
-# stores the CLI already reads; exported only when non-empty, since an empty
-# AWS_CA_BUNDLE counts as set and is worse than none.
+# so this is a no-op where no proxy is in the way. Exported only when non-empty,
+# since an empty AWS_CA_BUNDLE counts as set and is worse than none.
+#
+# This used to say Windows needed none of it, "whose stores the CLI already
+# reads". It does not: AWS CLI v2 bundles its own Python and its own CA list on
+# Windows exactly as on Linux, so from Git Bash `aws sts get-caller-identity`
+# fails the same way — and because that is what aws-check asks, every target
+# here reported the proxy as *missing credentials* and stopped before running.
+# There is no /etc/ssl/certs under msys, so name the combined corporate+certifi
+# bundle as a second candidate; first readable one wins.
+#
+# The Windows home has to come from cygpath rather than from $(HOME) or
+# $(USERPROFILE): make is an msys2 binary from a different installation than the
+# shell that invokes it, so $(HOME) can be /home/<user> — a path with no .certs
+# in it — while USERPROFILE may not survive into make at all. `cygpath -D` is
+# answered by the msys runtime itself and is right in both, and -m returns the
+# Windows form the CLI wants.
+WIN_HOME := $(if $(findstring NT,$(shell uname -s)),$(patsubst %/Desktop,%,$(shell cygpath -m -D 2>/dev/null)))
+AWS_CA_BUNDLE_CANDIDATES := /etc/ssl/certs/ca-certificates.crt \
+                            $(if $(WIN_HOME),$(WIN_HOME)/.certs/zscaler-plus-certifi.pem) \
+                            $(HOME)/.certs/zscaler-plus-certifi.pem
 ifeq (,$(strip $(AWS_CA_BUNDLE)))
-AWS_CA_BUNDLE := $(wildcard /etc/ssl/certs/ca-certificates.crt)
+AWS_CA_BUNDLE := $(firstword $(wildcard $(AWS_CA_BUNDLE_CANDIDATES)))
 endif
 ifneq (,$(strip $(AWS_CA_BUNDLE)))
 export AWS_CA_BUNDLE
 endif
 
+# `export` above reaches recipes but not $(shell) — confirmed on make 4.3: a
+# recipe sees the exported value, the shell function sees an empty string. So
+# every $(shell) that talks to AWS has to carry the profile and the CA bundle
+# itself. Named once here rather than inlined, because forgetting it does not
+# look like a credentials error at the call site: the command runs as whatever
+# the *default* profile is, which is a different account, and comes back with a
+# 403 or an empty result that the caller then misreports as missing state.
+AWS_SHELL_ENV = AWS_PROFILE=$(AWS_PROFILE) $(if $(AWS_CA_BUNDLE),AWS_CA_BUNDLE=$(AWS_CA_BUNDLE))
+
 # Derived from whichever credentials are active, so the backend never has to be
-# committed and switching AWS_PROFILE switches accounts cleanly.
-# `export` above reaches recipes but not $(shell), so name the profile inline
-# here too, along with the CA bundle for the same reason — otherwise BUCKET
-# silently resolves against the default account, or against nothing at all.
-ACCOUNT_ID = $(shell AWS_PROFILE=$(AWS_PROFILE) $(if $(AWS_CA_BUNDLE),AWS_CA_BUNDLE=$(AWS_CA_BUNDLE)) aws sts get-caller-identity --query Account --output text)
+# committed and switching AWS_PROFILE switches accounts cleanly. Without the
+# prefix BUCKET silently resolves against the default account, or against
+# nothing at all.
+ACCOUNT_ID = $(shell $(AWS_SHELL_ENV) aws sts get-caller-identity --query Account --output text)
 BUCKET     = $(PROJECT)-tf-state-$(ACCOUNT_ID)
 LOCK_TABLE = $(PROJECT)-tf-locks
 
@@ -348,8 +374,16 @@ db-stop: ## Stop the instance
 	$(DB) stop
 
 # Only for a database with no public endpoint. Leaves psql-able postgres on
-# localhost:$(LOCAL_PORT) for as long as the session is open.
-db-tunnel: ## Port-forward through the SSM bastion to localhost:$(LOCAL_PORT)
+# 127.0.0.1:$(LOCAL_PORT) — not `localhost`, which Windows answers with ::1
+# first and where libpq then burns its whole connect_timeout before falling
+# back — for as long as this runs.
+#
+# Supervised: it probes the session every 2 minutes, which both keeps SSM from
+# idling it out during a long materialisation and detects the case where it died
+# anyway, and reconnects with backoff when it has. See "The tunnel supervises
+# itself" in the README for the tunables (TUNNEL_SUPERVISE=0 for a plain
+# one-shot session) and for why a public endpoint is not the simpler answer.
+db-tunnel: ## Supervised port-forward through the SSM bastion to 127.0.0.1:$(LOCAL_PORT)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)
 
 # How far back `make app-logs` starts. Overridable: SINCE=1h.
@@ -393,23 +427,46 @@ APP_PLATFORM ?= linux/amd64
 # Read from the *shared* stack, not the per-env one — the repository is shared.
 # Resolved lazily (`=`, not `:=`) so the shell only runs for targets that use
 # it, and so it does not fail this file's parse when terraform is not inited.
-ECR_URL  = $(shell $(TF_SHARED) output -raw ecr_repository_url 2>/dev/null)
-ECR_HOST = $(firstword $(subst /, ,$(ECR_URL)))
+#
+# $(AWS_SHELL_ENV) is not optional here, for the reason given where it is
+# defined: terraform reads the state straight out of S3, so without the profile
+# it authenticates as the default account and S3 answers HeadObject with 403.
+# The 2>/dev/null below then ate that, and every app-* target reported it as an
+# un-applied shared stack — which is why this looked like missing state for as
+# long as it did.
+# Memoized on first use. The state lives in S3, so each lookup is a ~5s round
+# trip, and one `make app-push` references this five times over — the guard and
+# the image tag in each of app-login and app-build, then the push itself. The
+# $(eval)s expand to nothing, so this still yields just the URL. A failed
+# lookup caches as empty too, which is what the guard below wants: it reports
+# the failure once instead of re-running terraform at every reference.
+ECR_URL      = $(if $(_ECR_DONE),,$(eval _ECR_DONE := 1)$(eval _ECR_URL := $(_ECR_URL_SH)))$(_ECR_URL)
+_ECR_URL_SH  = $(shell $(AWS_SHELL_ENV) $(TF_SHARED) output -raw ecr_repository_url 2>/dev/null)
+ECR_HOST     = $(firstword $(subst /, ,$(ECR_URL)))
+
+# Re-run the lookup with stderr attached so the failure explains itself. Only
+# ever reached when ECR_URL came back empty, so the second terraform call costs
+# nothing in the normal path.
+define require_ecr_url
+[ -n "$(ECR_URL)" ] || { \
+  echo "no ecr_repository_url output from the shared stack. terraform says:" >&2; \
+  $(AWS_SHELL_ENV) $(TF_SHARED) output -raw ecr_repository_url >/dev/null; \
+  echo "(if the state itself is missing, run \`make apply-shared\`)" >&2; \
+  exit 1; }
+endef
 
 TF_OUT = $(TF) output -raw
 
 app-login: ## Log docker in to the shared ECR registry
-	@u="$(ECR_URL)"; \
-	[ -n "$$u" ] || { echo "no ecr_repository_url output — run \`make apply-shared\` first" >&2; exit 1; }; \
-	aws ecr get-login-password --region $(AWS_REGION) \
+	@$(require_ecr_url)
+	@aws ecr get-login-password --region $(AWS_REGION) \
 	  | docker login --username AWS --password-stdin "$(ECR_HOST)"
 
 app-build: ## Build the runtime image from $(APP_DIR)
-	@u="$(ECR_URL)"; \
-	[ -n "$$u" ] || { echo "no ecr_repository_url output — run \`make apply-shared\` first" >&2; exit 1; }; \
-	docker build --target runtime --platform $(APP_PLATFORM) \
+	@$(require_ecr_url)
+	@docker build --target runtime --platform $(APP_PLATFORM) \
 	  --build-arg BUILD_VERSION=$(APP_TAG) \
-	  -t "$$u:$(APP_TAG)" $(APP_DIR)
+	  -t "$(ECR_URL):$(APP_TAG)" $(APP_DIR)
 
 app-push: app-login app-build ## Build and push the image to ECR
 	@docker push "$(ECR_URL):$(APP_TAG)"

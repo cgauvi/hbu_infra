@@ -233,6 +233,22 @@ CREATE INDEX IF NOT EXISTS lot_zoning_envelopes_solvable_idx
     ON silver.lot_zoning_envelopes (lot_uid)
     WHERE governs_residential AND solver_ready;
 
+-- The two usage families beside Habitation, and the column that governs each
+-- of them for this lot — the solver prices all three now, and the developer's
+-- choice in gold.lot_highest_best_use is made across the governing column of
+-- each family. Written by the same assets; ADD COLUMN IF NOT EXISTS so a
+-- database created before they existed picks them up on the next `db.py
+-- init`, the way sql/009's later blocks do.
+ALTER TABLE silver.zoning_grid_columns
+    ADD COLUMN IF NOT EXISTS permits_commercial boolean,
+    ADD COLUMN IF NOT EXISTS permits_industrial boolean;
+
+ALTER TABLE silver.lot_zoning_envelopes
+    ADD COLUMN IF NOT EXISTS permits_commercial boolean,
+    ADD COLUMN IF NOT EXISTS permits_industrial boolean,
+    ADD COLUMN IF NOT EXISTS governs_commercial boolean,
+    ADD COLUMN IF NOT EXISTS governs_industrial boolean;
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';

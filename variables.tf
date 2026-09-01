@@ -213,6 +213,18 @@ variable "app_port" {
   default     = 8501
 }
 
+variable "app_tile_port" {
+  description = "Port the map's vector tile server listens on inside the container. hbu_rag_map runs it in the same process as Streamlit, on a second socket, because Streamlit serves no routes of its own and Leaflet has to fetch tiles over HTTP. The ALB routes /tiles/* here; matches HBU_TILE_PORT and the Dockerfile's second EXPOSE."
+  type        = number
+  default     = 8502
+}
+
+variable "app_tile_path_pattern" {
+  description = "The listener rule that separates tile traffic from the app's. Everything else falls through to the Streamlit target group, websocket included."
+  type        = string
+  default     = "/tiles/*"
+}
+
 variable "app_desired_count" {
   description = "How many tasks to run. One is enough for this workload and is what the cost model assumes; more than one is fine because the ALB is sticky, but each task holds its own session state and its own cache."
   type        = number

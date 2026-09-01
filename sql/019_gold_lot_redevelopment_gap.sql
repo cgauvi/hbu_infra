@@ -184,6 +184,27 @@ CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_unassessed_idx
     ON gold.lot_redevelopment_gap (lot_uid)
     WHERE NOT has_assessment;
 
+-- The discounted verdict this table used to stop short of, priced at the
+-- same InvestmentAssumptions the solve ran with (carried in the hbu row's
+-- program_assumptions). `hbu_npv_cad` is redeveloping: the discounted value
+-- of the proposed building less its capital. `existing_present_value_cad` is
+-- keeping the standing one: its stabilised NOI through the same PV factor.
+-- `redevelopment_npv_gain_cad` is the difference, a missing existing side
+-- read as nothing standing — the `is_underbuilt` rule, because a vacant
+-- parcel is exactly the case the ranking exists to surface. The land is in
+-- neither side, deliberately: the owner holds it in both futures, so it
+-- cancels out of the comparison.
+ALTER TABLE gold.lot_redevelopment_gap
+    ADD COLUMN IF NOT EXISTS hbu_npv_cad double precision,
+    ADD COLUMN IF NOT EXISTS hbu_present_value_cad double precision,
+    ADD COLUMN IF NOT EXISTS existing_present_value_cad double precision,
+    ADD COLUMN IF NOT EXISTS redevelopment_npv_gain_cad double precision;
+
+-- "Where is redevelopment worth the most" — the shortlist read the verdict
+-- column exists for.
+CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_npv_gain_idx
+    ON gold.lot_redevelopment_gap (redevelopment_npv_gain_cad DESC NULLS LAST);
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';

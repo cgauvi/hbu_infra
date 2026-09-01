@@ -198,12 +198,23 @@ def resolve(
     *,
     project: str = DEFAULT_PROJECT,
     region: str = DEFAULT_REGION,
+    through_tunnel: bool = True,
 ) -> Connection:
-    """Connection details, from DATABASE_URL if set and from AWS otherwise."""
+    """Connection details, from DATABASE_URL if set and from AWS otherwise.
+
+    ``through_tunnel=False`` returns the database's real address even while
+    --tunnel is in effect. Anything that *connects* wants the default; anything
+    that *records* the endpoint for someone else to read wants the real one.
+    """
     override = os.environ.get("DATABASE_URL")
     details = _from_url(override) if override else _from_ssm(project, env, region)
-    if _LOCAL_PORT is not None:
-        details = replace(details, host="localhost", port=_LOCAL_PORT)
+    if through_tunnel and _LOCAL_PORT is not None:
+        # 127.0.0.1, not "localhost": the Session Manager plugin binds IPv4
+        # only, and on a machine that resolves localhost to ::1 first libpq
+        # burns the entire connect_timeout on the dead address before falling
+        # back. The connection still succeeds, which is what makes it look like
+        # a slow tunnel rather than a misresolution.
+        details = replace(details, host="127.0.0.1", port=_LOCAL_PORT)
     return details
 
 
@@ -338,15 +349,39 @@ def cmd_env(args) -> int:
 
     if args.app:
         prefix = f"/{DEFAULT_PROJECT}-{args.env}"
+        ssm = _aws("ssm", args.region)
         try:
-            secret_id = _aws("ssm", args.region).get_parameter(
-                Name=f"{prefix}/db/app_secret_arn"
-            )["Parameter"]["Value"]
+            secret_id = ssm.get_parameter(Name=f"{prefix}/db/app_secret_arn")["Parameter"]["Value"]
         except Exception as exc:
             raise DbError(f"no {prefix}/db/app_secret_arn - apply the Terraform first") from exc
-        _shell_export("URBAN_RAG_PG_HOST", details.host)
+        # The role the secret belongs to, exported alongside it. Leaving this
+        # out was not neutral: the plain `env` above exports
+        # URBAN_RAG_PG_USER=hbu_admin, so evaluating that and then this in the
+        # same shell — or pasting the result into a .env — left the master
+        # username paired with the app role's password, and every connection
+        # failed as `password authentication failed for user "hbu_admin"`.
+        # The two halves of one credential are now always emitted together.
+        try:
+            app_user = ssm.get_parameter(Name=f"{prefix}/db/app_user")["Parameter"]["Value"]
+        except Exception as exc:
+            raise DbError(
+                f"no {prefix}/db/app_user - apply the Terraform first"
+            ) from exc
+        # HOST and HOSTADDR are split for the same reason the pipeline's .env
+        # splits them: the exports below set verify-full, and the certificate is
+        # issued to the endpoint, so HOST has to keep naming the endpoint for
+        # the hostname check while HOSTADDR carries the address the socket
+        # actually goes to. Exporting the tunnel address as HOST instead paired
+        # verify-full with a name the certificate does not cover, and every
+        # connection failed on `server certificate for ... does not match host
+        # name "127.0.0.1"`.
+        endpoint = resolve(args.env, region=args.region, through_tunnel=False)
+        _shell_export("URBAN_RAG_PG_HOST", endpoint.host)
+        if details.host != endpoint.host:
+            _shell_export("URBAN_RAG_PG_HOSTADDR", details.host)
         _shell_export("URBAN_RAG_PG_PORT", details.port)
         _shell_export("URBAN_RAG_PG_DATABASE", details.dbname)
+        _shell_export("URBAN_RAG_PG_USER", app_user)
         _shell_export("URBAN_RAG_PG_SECRET_ID", secret_id)
         _shell_export("URBAN_RAG_PG_REGION", args.region)
         _shell_export("URBAN_RAG_PG_SSLMODE", "verify-full")
@@ -496,7 +531,14 @@ def cmd_bootstrap(args) -> int:
 
 
 def _store_app_password(args, details: "Connection", password: str) -> None:
-    """Write the generated password into the secret Terraform created for it."""
+    """Write the generated password into the secret Terraform created for it.
+
+    ``details`` is what we connected as, which under --tunnel is a local port.
+    The endpoint written here is read by every other consumer of the secret, on
+    machines with no tunnel of their own, so it is resolved again without the
+    override. Writing the tunnel address instead pinned `host` at localhost for
+    everyone and silently overrode the pipeline's own URBAN_RAG_PG_HOST.
+    """
     prefix = f"/{DEFAULT_PROJECT}-{args.env}"
     ssm = _aws("ssm", args.region)
     try:
@@ -506,6 +548,8 @@ def _store_app_password(args, details: "Connection", password: str) -> None:
 
     # The shape PgSettings.secret_id expects, which is also the shape RDS
     # writes for a password it manages itself.
+    endpoint = resolve(args.env, region=args.region, through_tunnel=False)
+
     _aws("secretsmanager", args.region).put_secret_value(
         SecretId=secret_id,
         SecretString=json.dumps(
@@ -513,9 +557,9 @@ def _store_app_password(args, details: "Connection", password: str) -> None:
                 "username": args.app_user,
                 "password": password,
                 "engine": "postgres",
-                "host": details.host,
-                "port": details.port,
-                "dbname": details.dbname,
+                "host": endpoint.host,
+                "port": endpoint.port,
+                "dbname": endpoint.dbname,
             }
         ),
     )

@@ -47,12 +47,13 @@ and their state key.
 │  Shared VPC (10.20.0.0/16)                                             │
 │                                                                        │
 │  public   SSM bastion (t4g.nano)        ALB ──┐                        │
-│           egress only, no key                 │                        │
-│                │                              │ :8501, by security     │
-│                │                              ▼ group                  │
-│  public                                 Fargate task (Streamlit)       │
-│                │                              │      egress to ECR,    │
-│                │ :5432, by security group     │      Secrets Manager,  │
+│           egress only, no key                 │ :8501  everything      │
+│                │                              │ :8502  /tiles/*        │
+│                │                              ▼ both by security group │
+│  public                                 Fargate task                   │
+│                │                        Streamlit + the map's tiles    │
+│                │ :5432, by security group     │      egress to ECR,    │
+│                │                              │      Secrets Manager,  │
 │                └──────────────┬───────────────┘      HuggingFace       │
 │                               ▼                                        │
 │  private  RDS PostgreSQL 16 — no public endpoint                       │
@@ -84,10 +85,17 @@ security group, so "public subnet" is a routing fact rather than an exposure
 one. The longer version is in
 [Why the tasks sit in a public subnet](#why-the-tasks-sit-in-a-public-subnet).
 
-The three hops inside the VPC are all **security-group references, not CIDRs** —
-the ALB to the task on 8501, the task to the database on 5432, the bastion to
-the database on 5432. A Fargate task's address is assigned at start and changes
-on every deploy, so a CIDR rule could not describe it in the first place.
+The hops inside the VPC are all **security-group references, not CIDRs** — the
+ALB to the task on 8501 and on 8502, the task to the database on 5432, the
+bastion to the database on 5432. A Fargate task's address is assigned at start
+and changes on every deploy, so a CIDR rule could not describe it in the first
+place.
+
+The second task port is the map's geometry: the app draws its layers as vector
+tiles and Streamlit has no route to serve them from, so a tile server runs on
+its own socket in the same container and a listener rule sends `/tiles/*`
+there. See [Two ports, two target
+groups](#two-ports-two-target-groups-the-maps-tiles).
 
 That is `dev`. **`prod` is still the public posture** — a public endpoint locked
 to the applying machine's IP, no bastion, and `enable_app = false` — because
@@ -293,7 +301,8 @@ that creates the database has also created them.
 
 ```bash
 make bootstrap                        # 1. state backend, once per account
-make plan-shared apply-shared         # 2. VPC + ECR, once
+make plan-shared apply-shared         # 
+#2. VPC + ECR, once
 make app-push     ENV=dev             # 3. an image for the service to start on
 make plan apply   ENV=dev             # 4. database, ALB, service, both secrets
 
@@ -602,6 +611,141 @@ command works from a laptop with nothing else set up, and `rds.force_ssl = 1`
 means the traffic is TLS whatever the client asks for. It is also still a
 database on the public internet.
 
+### The tunnel supervises itself
+
+A raw port-forward is not durable enough to run a pipeline through, and the way
+it fails is worse than the failing.
+
+Session Manager closes an idle session after about 20 minutes — 60 at the
+absolute most, and that ceiling is account-wide, set on the
+`SSM-SessionManagerRunShell` preferences document. `setbacks` is 53 minutes of
+one server-side PostGIS statement, and `programs` is a ~16-minute CP-SAT solve.
+For all of that time the client is waiting on a query and this port carries no
+traffic, so the session idles out from under a job that is working perfectly.
+
+When it does, `session-manager-plugin` **keeps running and keeps its listener**.
+The port stays open. `connect()` still succeeds. Nothing ever comes back. Every
+client after that blocks for its full `connect_timeout` and then reports
+something that reads like a slow database — and `hbu_rag_map`'s pool, which
+hardcodes `timeout=15.0`, raises `PoolTimeout` while libpq is still waiting. A
+dead tunnel and a healthy one are indistinguishable from the client, which is
+why this cost so many hours before it was named.
+
+So `scripts/tunnel.sh` supervises the session rather than `exec`ing it:
+
+- a health probe every `TUNNEL_KEEPALIVE_INTERVAL` seconds (120 by default),
+  which doubles as the keepalive — the traffic it generates is what stops the
+  session idling out in the first place;
+- a failed probe tears the session down and reconnects, with backoff to a
+  60-second ceiling, so a suspended laptop comes back to a poll rather than to a
+  hot loop;
+- the bastion instance id is re-resolved on every reconnect, because a
+  stop/start gives it a new one;
+- a preflight that refuses to start when something already holds the port, and
+  names the process holding it instead of leaving the plugin to report
+  "Address already in use" long after the context that would explain it.
+
+The local address does not change across a reconnect, so a `psql` or a Dagster
+run that is merely *idle* survives one. It does **not** rescue an in-flight
+query: a reconnect drops the TCP connections through it, and whatever was
+running gets a closed connection and has to retry. What it fixes is the tunnel
+not being there afterwards.
+
+#### The probe is an SSLRequest, not a connect
+
+"Is the port open" is not a health check, for the reason above. Only a round
+trip to the far end is. The probe sends Postgres' `SSLRequest` — eight bytes,
+length 8 and request code 80877103 — to which any live server replies with a
+single byte: `S` if it will do TLS, `N` if it will not.
+
+It needs no credentials, so it cannot fail for a reason that has nothing to do
+with the tunnel, and it holds no connection open. Against the dead session that
+was found holding port 5433 while this was being written, a plain TCP connect
+succeeded and the SSLRequest timed out with no reply — which is exactly the
+discrimination that was wanted.
+
+Its one cost is server-side noise: the probe hangs up after reading the reply
+rather than completing a handshake, and Postgres logs that as a failed SSL
+connection — roughly 700 lines a day into the instance's CloudWatch log group at
+the default interval. Raise `TUNNEL_KEEPALIVE_INTERVAL` if that matters more
+than detecting a dead session quickly.
+
+#### Reading it, and turning it off
+
+```
+$ make db-tunnel ENV=dev
+tunnelling hbu-dev.…rds.amazonaws.com:5432 -> 127.0.0.1:5433 via i-05307ac744d9086ec
+08:45:21  up on 127.0.0.1:5433 — probing every 120s, Ctrl-C to close
+09:31:44  keepalive probe got no answer — the session is dead upstream
+09:31:47  reconnecting in 5s (attempt 1)
+09:31:55  up on 127.0.0.1:5433 — probing every 120s, Ctrl-C to close
+```
+
+Status goes to stderr; the plugin's own banner and its one line per accepted
+connection are captured to `$TMPDIR/hbu-tunnel-<env>-<port>.log` and printed
+only when a session fails to come up — which is where the real reason lives,
+since an expired SSO session says so there and nowhere else.
+
+| Variable | Default | |
+|---|---|---|
+| `TUNNEL_SUPERVISE` | `1` | `0` runs a single foreground session, the old behaviour. For when the plugin itself is what is being debugged. |
+| `TUNNEL_KEEPALIVE_INTERVAL` | `120` | Seconds between probes. |
+| `TUNNEL_READY_TIMEOUT` | `60` | Seconds a new session gets to open the port and answer. |
+| `TUNNEL_PROBE_TIMEOUT` | `10` | Seconds one probe waits for its reply. |
+| `TUNNEL_BACKOFF_MAX` | `60` | Reconnect backoff ceiling. |
+
+All five are forwarded across the WSL re-exec, and only when actually set — an
+empty `TUNNEL_SUPERVISE=` is not `1`, and forwarding it unconditionally would
+have silently disabled supervision for every Windows caller.
+
+Two notes for anyone editing this script. It runs under `set -euo pipefail`,
+and the combination is hostile to a supervisor: `pgrep` matching nothing exits
+1, `pipefail` carries that through a pipe, and a failed command substitution in
+an assignment trips `errexit` — so the supervisor exits(1) at precisely the
+moment it was supposed to reconnect. That bug was in the first version of this
+and is why `kill_session` and `resolve_target` carry explicit `|| true` and
+`|| BASTION_ID=`. And `pkill -f 'ssm start-session'` matches *its own shell*;
+kill by PID.
+
+### Why the public posture is not an option from this laptop
+
+The obvious simplification — give `hbu-dev` a public endpoint and allowlist a
+home IP, which is what `prod.tfvars` already does and what `db_subnet_tier` and
+`allow_current_ip` already support — does not work from this machine, and the
+reason is on the client side rather than in AWS.
+
+Measured 2026-09-01, from the workstation this repo is developed on:
+
+| Outbound TCP | Result |
+|---|---|
+| 80 | HTTP 200 in 0.49s |
+| 22 | HTTP 200 in 0.31s — **open** |
+| 443, non-TLS payload | connection **reset** in 0.23s (the proxy expects a `ClientHello`) |
+| 5432 | **silently dropped** — timed out at 12s, 20s and 20s on three tries |
+| 8080 | **silently dropped** — timed out at 15s |
+
+Zscaler Client Connector (`ZSATunnel`, `ZSAService`) is running, and the policy
+is not "web only": **22 is open, database ports are not**. It looks like a
+deliberate rule against reaching databases directly rather than a blanket
+restriction, which matters, because it means SSH to an instance is a route that
+works while a public endpoint is not.
+
+A public endpoint on 5432 would still be unreachable — the packets never leave
+the laptop, so no security-group change can help. Moving the instance to port
+443 does not rescue it either: libpq opens with an 8-byte `SSLRequest`, not a
+TLS `ClientHello`, so the proxy resets it exactly as it reset the probe above.
+
+This is enforced by an agent on the endpoint, so it follows the laptop to any
+network. The HTTP egress address is a residential one (`AS1403 EBOX`,
+Montréal), not a Zscaler datacenter range, so allowlisting *would* be
+well-scoped if the port were open — the obstacle is only the port.
+
+SSM is not incidental complexity here. It rides 443 to an AWS endpoint the proxy
+already allows, which is why it is the one thing that works. Changing that needs
+a Zscaler bypass for the RDS endpoint on 5432, which is an IT request rather
+than a Terraform change; the Terraform half is three lines in `dev.tfvars` and
+is already written and tested by `prod`.
+
 ### Changing tier replaces the instance
 
 Not modifies — replaces. `ModifyDBInstance` accepts a new DB subnet group only
@@ -658,6 +802,70 @@ then fail on its first question.
 "Public subnet" is a routing fact, not an exposure one. The task security group
 accepts inbound **only** from the ALB's security group, so the public IP
 carries egress and answers nothing.
+
+### Two ports, two target groups: the map's tiles
+
+The app serves on one port and the map's geometry on another, and the ALB has
+a rule that separates them. It is worth explaining because "one service, two
+target groups" is unusual enough to look like an accident.
+
+`hbu_rag_map` draws its lots, footprints, zones and massing as Mapbox Vector
+Tiles rather than as GeoJSON embedded in the page — that repo's README has the
+why, and the short version is that a page carrying a borough's cadastre is a
+page that stops responding. Leaflet fetches those tiles over HTTP from inside
+the map, and **Streamlit serves no routes of its own**, so the app runs a small
+tile server on a second socket in the same process. This stack's whole job is
+to put that socket somewhere the browser can reach it:
+
+```
+                 ALB listener
+                      │
+       ┌──────────────┴───────────────┐
+   /tiles/*                      everything else
+       │                              │
+  tiles TG :8502                 app TG :8501
+       └──────────── same task ───────┘
+```
+
+One task, registered twice. Not a second service, because the tile server *is*
+the app process: it borrows the same connection pool, the same resolved
+endpoint, the same `verify-full` posture, and it would gain nothing from a
+container of its own but a second copy of all of that to keep in step.
+
+**The two target groups are configured as opposites, and every difference is
+one fact read twice: a tile request is stateless.** The app's group is sticky,
+because session state lives in a task's memory and a reconnecting websocket has
+to land back on it. The tile group is not, because a tile is a pure function of
+its URL — pinning them would only bunch every tile onto whichever task the
+first request happened to reach. It health-checks `/tiles/healthz` rather than
+`/_stcore/health`, and drains in ten seconds rather than thirty, since a tile
+is milliseconds and not a streamed answer.
+
+**A listener rule does not make the tiles public.** Every tile URL carries a
+key `hbu_rag_map` derives from the same `HBU_APP_PASSWORD` this stack injects
+from Secrets Manager — an HMAC of it, never the password — and the tile server
+refuses a request without one. That is what keeps a path rule from putting the
+cadastre and a solved development programme on the internet. It is *derived*
+rather than random precisely so every task computes the same one, which is what
+makes the missing stickiness above safe. `/tiles/healthz` is the only path
+outside the check, because a health check carries no credentials.
+
+`HBU_TILE_BASE_URL` is set to the empty string in the task definition, and that
+is the whole of what tells the app it is behind a load balancer: the tile URLs
+come out relative (`/tiles/lots/{z}/{x}/{y}.mvt`), so they resolve against
+whatever DNS name the ALB is reached by and nothing in this repo has to know
+it. A laptop leaves the variable unset and gets an absolute
+`http://localhost:8502` instead, because there Streamlit and the tiles really
+are two origins.
+
+`app_tile_port` and `app_tile_path_pattern` are the two knobs. The port has to
+agree with the container's `HBU_TILE_PORT`, which the task definition also
+sets, so there is one number in one place.
+
+**Checking it after a deploy:** `terraform output app_tiles_health_url` and
+fetch it. A 200 says the rule reaches the task's second port. A tile itself
+needs the key, so that path is the only part of the endpoint that answers
+unauthenticated — which makes it exactly the right thing to curl.
 
 ### HTTPS, and pointing a domain at it
 
@@ -839,8 +1047,8 @@ defaults to medium for that reason.
 | [`ssm.tf`](ssm.tf) | The `/hbu-<env>/db/*` contract, the app-role secret, the IAM policy for readers |
 | [`bastion.tf`](bastion.tf) | Optional SSM jump host (`enable_bastion`) |
 | [`schedule.tf`](schedule.tf) | Optional overnight stop/start (`enable_scheduled_shutdown`) |
-| [`alb.tf`](alb.tf) | The public load balancer, its security group, target group, and the 80/443 listeners `app_certificate_arn` switches between (`enable_app`) |
-| [`ecs.tf`](ecs.tf) | The Fargate cluster, task definition, service, task IAM roles, and the two application secrets |
+| [`alb.tf`](alb.tf) | The public load balancer, its security group, the app and tile target groups, the 80/443 listeners `app_certificate_arn` switches between, and the `/tiles/*` rule (`enable_app`) |
+| [`ecs.tf`](ecs.tf) | The Fargate cluster, task definition (both ports), service (both target groups), task IAM roles, and the two application secrets |
 | [`outputs.tf`](outputs.tf) | Connection details, the app URL, and the ALB's DNS name and zone for a CNAME or alias record |
 | [`sql/`](sql/) | Extensions, the `rag` working set, the partitioned `silver`/`gold` tables and the function that creates their partitions, spatial search functions |
 | [`scripts/db.py`](scripts/db.py) | The CLI everything above is driven through |
@@ -855,7 +1063,7 @@ numbers are what say what has to exist before what:
 | File | Creates | Needs first |
 |---|---|---|
 | [`000_roles.sql`](sql/000_roles.sql) | `urban_rag`, `urban_rag_ro`, the five schemas, the grants | the master user |
-| [`001_extensions.sql`](sql/001_extensions.sql) | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements` | `rds_superuser` |
+| [`001_extensions.sql`](sql/001_extensions.sql) | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements`, and a notice if PostGIS is too old for the map's vector tiles | `rds_superuser` |
 | [`002_spatial.sql`](sql/002_spatial.sql) | `rag.features`, `rag.lots`, `rag.buildings` | 001, for `geometry` |
 | [`003_spatial_search.sql`](sql/003_spatial_search.sql) | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot`, `rag.corpus_status` | `rag.chunks` — *skipped until it exists* |
 | [`003_warehouse.sql`](sql/003_warehouse.sql) | `warehouse.ensure_partition`, `warehouse.partitions` | 000 |

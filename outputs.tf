@@ -114,6 +114,18 @@ output "app_url" {
   ])
 }
 
+output "app_tiles_health_url" {
+  description = "The map's vector tile server, through the ALB. A 200 here says the /tiles/* listener rule reaches the task's second port; a tile itself needs the key hbu_rag_map derives from the access password, so this health path is the only part of the tile endpoint that answers unauthenticated."
+  value = one([
+    for lb in aws_lb.app :
+    format(
+      "%s://%s/tiles/healthz",
+      var.app_certificate_arn == "" ? "http" : "https",
+      lb.dns_name,
+    )
+  ])
+}
+
 output "app_cluster" {
   description = "ECS cluster name — what `aws ecs` calls take as --cluster"
   value       = one(aws_ecs_cluster.main[*].name)

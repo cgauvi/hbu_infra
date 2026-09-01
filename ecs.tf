@@ -70,6 +70,21 @@ resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   ip_protocol                  = "tcp"
 }
 
+# The map's vector tiles, off a second socket in the same container. Still ALB
+# only: the tile server has its own access key, but a port reachable from the
+# VPC would be one more thing standing between the cadastre and the internet
+# than there needs to be.
+resource "aws_vpc_security_group_ingress_rule" "app_tiles_from_alb" {
+  count = var.enable_app ? 1 : 0
+
+  security_group_id            = aws_security_group.app[0].id
+  description                  = "Map vector tiles from the load balancer"
+  referenced_security_group_id = aws_security_group.alb[0].id
+  from_port                    = var.app_tile_port
+  to_port                      = var.app_tile_port
+  ip_protocol                  = "tcp"
+}
+
 # Outbound is wide because the destinations are: ECR and its S3 layer store,
 # CloudWatch Logs, Secrets Manager, SSM, the RDS endpoint, and HuggingFace —
 # the last of which resolves to a CDN with no stable address to pin.
@@ -314,6 +329,12 @@ resource "aws_ecs_task_definition" "app" {
         {
           containerPort = var.app_port
           protocol      = "tcp"
+        },
+        # The map's tile server. One container, two sockets — see the tile
+        # target group in alb.tf for why it is not a second service.
+        {
+          containerPort = var.app_tile_port
+          protocol      = "tcp"
         }
       ]
 
@@ -336,6 +357,16 @@ resource "aws_ecs_task_definition" "app" {
         # something a shared password should be the only thing in front of.
         { name = "APP_ENV", value = var.app_env_mode },
         { name = "LOG_LEVEL", value = var.app_log_level },
+
+        # The map's vector tiles. The port has to agree with the portMapping
+        # above and the tile target group in alb.tf; the empty base URL is what
+        # tells hbu_rag_map to write *relative* tile URLs, which is correct
+        # here and only here — `/tiles/...` resolves against whatever DNS name
+        # the load balancer is reached by, so nothing in this file has to know
+        # it. A laptop, with no ALB in front of it, leaves this unset and gets
+        # an absolute http://localhost:8502 instead.
+        { name = "HBU_TILE_PORT", value = tostring(var.app_tile_port) },
+        { name = "HBU_TILE_BASE_URL", value = "" },
       ]
 
       secrets = [
@@ -406,6 +437,17 @@ resource "aws_ecs_service" "app" {
     target_group_arn = aws_lb_target_group.app[0].arn
     container_name   = "app"
     container_port   = var.app_port
+  }
+
+  # The same task registered a second time, on its tile port. ECS keeps both
+  # registrations in step, so a task draining out of one drains out of the
+  # other — which matters more than it sounds: a task still serving tiles after
+  # its Streamlit half had gone would answer with the geometry of a deployment
+  # the page it is drawn on no longer comes from.
+  load_balancer {
+    target_group_arn = aws_lb_target_group.tiles[0].arn
+    container_name   = "app"
+    container_port   = var.app_tile_port
   }
 
   # Streamlit's cold start is slow — imports first, then the SSM and Secrets

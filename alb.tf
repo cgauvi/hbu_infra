@@ -62,6 +62,20 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
   ip_protocol                  = "tcp"
 }
 
+# The same task, the second socket. A separate rule rather than a widened port
+# range because the two ports carry different traffic for different reasons,
+# and a range would quietly cover anything that ever landed between them.
+resource "aws_vpc_security_group_egress_rule" "alb_to_tiles" {
+  count = var.enable_app ? 1 : 0
+
+  security_group_id            = aws_security_group.alb[0].id
+  description                  = "Forward map tile requests to the application tasks"
+  referenced_security_group_id = aws_security_group.app[0].id
+  from_port                    = var.app_tile_port
+  to_port                      = var.app_tile_port
+  ip_protocol                  = "tcp"
+}
+
 resource "aws_lb" "app" {
   count = var.enable_app ? 1 : 0
 
@@ -136,6 +150,69 @@ resource "aws_lb_target_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
+# The map's tiles
+#
+# A second target group on the same tasks, and the reason there are two rather
+# than one is that Streamlit does not serve routes. The map draws its lots,
+# footprints, zones and massing as Mapbox Vector Tiles, which Leaflet fetches
+# over HTTP from inside the page — so hbu_rag_map runs a small tile server on
+# a second socket in the same process and this sends `/tiles/*` to it.
+#
+# Everything about this group is the opposite of the app's, and each difference
+# is the same fact read twice: **a tile request is stateless.**
+#
+#   no stickiness — the app's group has it because session state lives in a
+#     task's memory and a reconnecting websocket must land back on it. A tile
+#     is a pure function of its URL, so any task may answer any tile, and
+#     pinning them would only bunch them onto one.
+#   its own health path — `/tiles/healthz`, which the tile server answers
+#     without the access key, because a health check carries no credentials.
+#   a longer deregistration delay is unnecessary — a tile is milliseconds, not
+#     a streamed answer — so this drains faster than the app.
+#
+# The tiles are not public: every URL carries a key hbu_rag_map derives from
+# the same HBU_APP_PASSWORD the UI asks for, and the server refuses a request
+# without it. That is what keeps a listener rule from putting the cadastre and
+# a solved development programme on the internet. It is derived rather than
+# random precisely so that every task computes the same one — which is what
+# makes "no stickiness" above safe.
+# ---------------------------------------------------------------------------
+
+resource "aws_lb_target_group" "tiles" {
+  count = var.enable_app ? 1 : 0
+
+  # Six characters, for the reason the app's group gives: AWS caps a target
+  # group's name_prefix there, and the lifecycle block needs create-before-
+  # destroy. The hyphens come out first — AWS appends its own suffix, and a
+  # prefix ending in one produces a name it rejects — which leaves "t" plus
+  # five characters of "hbudev", enough to tell two environments' groups apart
+  # in the console and distinct from the app's, which keeps the hyphen.
+  name_prefix = substr("t${replace(local.prefix, "-", "")}", 0, 6)
+
+  port        = var.app_tile_port
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = data.terraform_remote_state.shared.outputs.vpc_id
+
+  health_check {
+    path                = "/tiles/healthz"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  deregistration_delay = 10
+
+  tags = { Name = "${local.prefix}-tiles-tg" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Listeners
 #
 # With no certificate this is a plain port 80 listener and the password the
@@ -184,6 +261,53 @@ resource "aws_lb_listener" "https" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app[0].arn
+  }
+}
+
+# ---------------------------------------------------------------------------
+# `/tiles/*` goes to the tile group; everything else falls through
+#
+# The rule attaches to whichever listener actually *forwards*, which is why
+# there are two of these and only ever one exists. With no certificate that is
+# port 80. With one, port 80 redirects — tiles included, which is right: the
+# browser follows the 301 to HTTPS and asks again there, where the rule is.
+#
+# Priority 100 leaves room below it for anything more specific added later.
+# ---------------------------------------------------------------------------
+
+resource "aws_lb_listener_rule" "tiles_http" {
+  count = var.enable_app && var.app_certificate_arn == "" ? 1 : 0
+
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 100
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tiles[0].arn
+  }
+
+  condition {
+    path_pattern {
+      values = [var.app_tile_path_pattern]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "tiles_https" {
+  count = var.enable_app && var.app_certificate_arn != "" ? 1 : 0
+
+  listener_arn = aws_lb_listener.https[0].arn
+  priority     = 100
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tiles[0].arn
+  }
+
+  condition {
+    path_pattern {
+      values = [var.app_tile_path_pattern]
+    }
   }
 }
 

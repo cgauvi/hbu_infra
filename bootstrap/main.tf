@@ -150,6 +150,16 @@ variable "github_repo" {
   default     = "cgauvi/hbu_rag_map"
 }
 
+variable "github_repo_immutable" {
+  description = "GitHub OIDC immutable repo segment, in 'owner@owner-id/repo@repo-id' format"
+  type        = string
+  default     = "cgauvi@29102084/hbu_rag_map@1341808479"
+}
+
+locals {
+  github_deploy_branches = ["master", "main", "develop"]
+}
+
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
@@ -177,12 +187,15 @@ data "aws_iam_policy_document" "github_oidc_assume" {
       # branches (via workflow_run, which still presents the branch ref) and
       # workflow_dispatch runs, both of which authenticate with the ref of
       # whichever branch they ran from. No GitHub Environment is used here,
-      # so no environment:<name> sub is needed.
-      values = [
-        "repo:${var.github_repo}:ref:refs/heads/master",
-        "repo:${var.github_repo}:ref:refs/heads/main",
-        "repo:${var.github_repo}:ref:refs/heads/develop",
-      ]
+      # so no environment:<name> sub is needed. GitHub repositories using
+      # immutable OIDC subjects include owner and repo IDs in the repo segment;
+      # keep both forms so an opt-out does not break deployment.
+      values = flatten([
+        for branch in local.github_deploy_branches : [
+          "repo:${var.github_repo}:ref:refs/heads/${branch}",
+          "repo:${var.github_repo_immutable}:ref:refs/heads/${branch}",
+        ]
+      ])
     }
   }
 }
