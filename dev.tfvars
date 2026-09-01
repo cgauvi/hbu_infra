@@ -8,12 +8,23 @@ db_subnet_tier         = "private"
 db_publicly_accessible = false
 allow_current_ip       = false
 
-# Sizing is an HNSW question, not a storage one: the index has to fit in
-# memory to be fast, at roughly rows x dimension x 4 bytes plus the graph.
-# 1024-wide bge-m3 vectors are ~4 KB each, so the current VSMPE corpus (~500
-# chunks, ~2 MB) fits a micro with room to spare. Past ~100k chunks that is
-# ~400 MB of vectors alone and this wants a db.t4g.medium.
-db_instance_class    = "db.t4g.micro"
+# Sizing is normally an HNSW question, not a storage one: the index has to
+# fit in memory to be fast, at roughly rows x dimension x 4 bytes plus the
+# graph. 1024-wide bge-m3 vectors are ~4 KB each, so the current VSMPE corpus
+# (~500 chunks, ~2 MB) fits a micro with room to spare. Past ~100k chunks
+# that is ~400 MB of vectors alone and this wants a db.t4g.medium.
+#
+# It is a different question for the HBU spatial assets, which is why this is
+# currently db.m6g.large rather than the micro the corpus alone would need.
+# `silver.lot_buildable_setbacks` classifies every boundary segment of every
+# lot in a borough inside one server-side `CREATE TEMP TABLE AS`, and on a
+# micro (1 GB RAM, burstable) that statement cannot finish within
+# `URBAN_RAG_PG_STATEMENT_TIMEOUT_SECONDS` at all — it was still running past
+# 30 minutes on a full VSMPE partition and had to be killed. On m6g.large it
+# completes in under an hour end to end. Resized 2026-08-31 for that run; move
+# back to db.t4g.micro when the pipeline is not actively being materialized —
+# it costs roughly 10x as much per hour idle.
+db_instance_class    = "db.m6g.large"
 db_allocated_storage = 20
 
 # Dev is rebuildable from the dataplatform's parquet, so keep one day of

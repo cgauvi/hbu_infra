@@ -473,6 +473,15 @@ ALTER TABLE gold.lot_profiles
     ADD COLUMN IF NOT EXISTS estimated_value_basis text,
     ADD COLUMN IF NOT EXISTS assessed_to_estimated_ratio double precision,
     ADD COLUMN IF NOT EXISTS num_comparables integer NOT NULL DEFAULT 0,
+    -- The commerce split, carried up from sql/016. `commercial_floor_area_m2`
+    -- and `commercial_income_cad` keep the meaning they had; these say what
+    -- each is made of. They exist because silver.commercial_rents (sql/020)
+    -- surveys retail and office apart - the CUBF's 4000s against its 5000s and
+    -- 6000s - and the two are dollars a square foot apart in Montreal.
+    ADD COLUMN IF NOT EXISTS retail_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS office_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS retail_income_cad double precision,
+    ADD COLUMN IF NOT EXISTS office_income_cad double precision,
     -- The k most similar lots, with the metric that chose them: {k,
     -- max_distance_m, num_candidates, scales, penalties, weights, neighbors}.
     -- The metric travels with the list because a neighbour list means nothing

@@ -175,8 +175,8 @@ DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tu
 
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
-        db-deps uv-check db-init db-check db-shell db-url db-env db-query db-wait \
-        db-start db-stop db-tunnel \
+        db-deps uv-check db-init db-check db-shell db-url db-secret db-env \
+        db-query db-wait db-start db-stop db-tunnel \
         app-login app-build app-push app-deploy app-status app-wait app-logs \
         app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token
 
@@ -187,7 +187,7 @@ help:
 # check runs once per invocation no matter how many of these are named.
 bootstrap init-shared plan-shared apply-shared destroy-shared \
 init plan apply destroy validate output: | aws-check
-db-init db-bootstrap db-ca db-check db-shell db-url db-env db-app-env \
+db-init db-bootstrap db-ca db-check db-shell db-url db-secret db-env db-app-env \
 db-query db-wait db-start db-stop db-tunnel: | aws-check
 app-login app-build app-push app-deploy app-status app-wait app-logs \
 app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token: | aws-check
@@ -326,7 +326,10 @@ db-shell: ## Interactive SQL (psql when installed, built-in REPL otherwise)
 db-url: ## Print the connection URL
 	$(DB) url
 
-db-env: ## Master-user exports — use as: eval "$$(make -s db-env)"
+db-secret: ## Print the RDS master secret, plus password_urlencoded and database_url
+	@$(DB) secret
+
+db-env: ## Master-user exports - use as: eval "$$(make -s db-env)"
 	@$(DB) env
 
 db-app-env: ## Pipeline-role exports (URBAN_RAG_PG_*, password via Secrets Manager)

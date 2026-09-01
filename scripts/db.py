@@ -43,13 +43,14 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote as url_quote
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 
@@ -94,9 +95,9 @@ class Connection:
     sslmode: str = "require"
 
     def url(self, *, hide_password: bool = False) -> str:
-        secret = "***" if hide_password else quote(self.password, safe="")
+        secret = "***" if hide_password else url_quote(self.password, safe="")
         return (
-            f"postgresql://{quote(self.user, safe='')}:{secret}"
+            f"postgresql://{url_quote(self.user, safe='')}:{secret}"
             f"@{self.host}:{self.port}/{self.dbname}?sslmode={self.sslmode}"
         )
 
@@ -120,7 +121,7 @@ def _aws(service: str, region: str):
     return boto3.client(service, region_name=region)
 
 
-def _from_ssm(project: str, env: str, region: str) -> Connection:
+def _ssm_values(project: str, env: str, region: str) -> dict[str, str]:
     prefix = f"/{project}-{env}"
     ssm = _aws("ssm", region)
 
@@ -139,15 +140,24 @@ def _from_ssm(project: str, env: str, region: str) -> Connection:
             f"  Has `make apply ENV={env}` run? Is AWS_PROFILE pointing at the right account?"
         )
 
-    secret_arn = values["db/secret_arn"]
+    return values
+
+
+def _master_secret(secret_arn: str, region: str) -> dict:
     secrets = _aws("secretsmanager", region)
     try:
-        payload = json.loads(secrets.get_secret_value(SecretId=secret_arn)["SecretString"])
+        return json.loads(secrets.get_secret_value(SecretId=secret_arn)["SecretString"])
     except Exception as exc:
         raise DbError(
             f"could not read the master password from {secret_arn}: {exc}\n"
             "  The RDS-managed secret needs secretsmanager:GetSecretValue."
         ) from exc
+
+
+def _from_ssm(project: str, env: str, region: str) -> Connection:
+    values = _ssm_values(project, env, region)
+    secret_arn = values["db/secret_arn"]
+    payload = _master_secret(secret_arn, region)
 
     return Connection(
         host=values["db/host"],
@@ -281,6 +291,38 @@ def cmd_url(args) -> int:
     return 0
 
 
+def cmd_secret(args) -> int:
+    """Print the RDS-managed master secret with URL-safe connection helpers."""
+    values = _ssm_values(DEFAULT_PROJECT, args.env, args.region)
+    payload = _master_secret(values["db/secret_arn"], args.region).copy()
+
+    password = str(payload.get("password", ""))
+    host = str(payload.get("host") or values["db/host"])
+    port = int(payload.get("port") or values["db/port"])
+    dbname = str(payload.get("dbname") or values["db/name"])
+    user = str(payload.get("username") or values["db/user"])
+
+    payload.setdefault("host", host)
+    payload.setdefault("port", port)
+    payload.setdefault("dbname", dbname)
+    payload.setdefault("username", user)
+    payload["password_urlencoded"] = url_quote(password, safe="")
+    payload["database_url"] = Connection(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+    ).url()
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _shell_export(name: str, value: object) -> None:
+    print(f"export {name}={shlex.quote(str(value))}")
+
+
 def cmd_env(args) -> int:
     """Shell exports: `eval "$(./scripts/db.py env)"`.
 
@@ -301,29 +343,29 @@ def cmd_env(args) -> int:
                 Name=f"{prefix}/db/app_secret_arn"
             )["Parameter"]["Value"]
         except Exception as exc:
-            raise DbError(f"no {prefix}/db/app_secret_arn — apply the Terraform first") from exc
-        print(f"export URBAN_RAG_PG_HOST={details.host}")
-        print(f"export URBAN_RAG_PG_PORT={details.port}")
-        print(f"export URBAN_RAG_PG_DATABASE={details.dbname}")
-        print(f"export URBAN_RAG_PG_SECRET_ID={secret_id}")
-        print(f"export URBAN_RAG_PG_REGION={args.region}")
-        print("export URBAN_RAG_PG_SSLMODE=verify-full")
-        print(f"export PGSSLROOTCERT={CA_BUNDLE}")
+            raise DbError(f"no {prefix}/db/app_secret_arn - apply the Terraform first") from exc
+        _shell_export("URBAN_RAG_PG_HOST", details.host)
+        _shell_export("URBAN_RAG_PG_PORT", details.port)
+        _shell_export("URBAN_RAG_PG_DATABASE", details.dbname)
+        _shell_export("URBAN_RAG_PG_SECRET_ID", secret_id)
+        _shell_export("URBAN_RAG_PG_REGION", args.region)
+        _shell_export("URBAN_RAG_PG_SSLMODE", "verify-full")
+        _shell_export("PGSSLROOTCERT", CA_BUNDLE)
         return 0
 
-    print(f"export PGHOST={details.host}")
-    print(f"export PGPORT={details.port}")
-    print(f"export PGDATABASE={details.dbname}")
-    print(f"export PGUSER={details.user}")
-    print(f"export PGPASSWORD={details.password}")
-    print("export PGSSLMODE=require")
-    print(f"export DATABASE_URL='{details.url()}'")
-    print(f"export URBAN_RAG_PG_HOST={details.host}")
-    print(f"export URBAN_RAG_PG_PORT={details.port}")
-    print(f"export URBAN_RAG_PG_DATABASE={details.dbname}")
-    print(f"export URBAN_RAG_PG_USER={details.user}")
-    print(f"export URBAN_RAG_PG_PASSWORD={details.password}")
-    print(f"export URBAN_RAG_PG_REGION={args.region}")
+    _shell_export("PGHOST", details.host)
+    _shell_export("PGPORT", details.port)
+    _shell_export("PGDATABASE", details.dbname)
+    _shell_export("PGUSER", details.user)
+    _shell_export("PGPASSWORD", details.password)
+    _shell_export("PGSSLMODE", "require")
+    _shell_export("DATABASE_URL", details.url())
+    _shell_export("URBAN_RAG_PG_HOST", details.host)
+    _shell_export("URBAN_RAG_PG_PORT", details.port)
+    _shell_export("URBAN_RAG_PG_DATABASE", details.dbname)
+    _shell_export("URBAN_RAG_PG_USER", details.user)
+    _shell_export("URBAN_RAG_PG_PASSWORD", details.password)
+    _shell_export("URBAN_RAG_PG_REGION", args.region)
     return 0
 
 
@@ -766,6 +808,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("url", help="print the connection URL")
     p.add_argument("--hide-password", action="store_true", help="mask the password")
     p.set_defaults(func=cmd_url)
+
+    sub.add_parser(
+        "secret",
+        help="print the RDS master secret with URL-safe fields",
+    ).set_defaults(func=cmd_secret)
 
     p = sub.add_parser("env", help="print shell exports (PG* and URBAN_RAG_PG*)")
     p.add_argument("--app", action="store_true", help="the pipeline's role via Secrets Manager, not the master user")

@@ -27,19 +27,28 @@
 -- CUBF use code (rl0105a) rather than by a dominant use for the lot, so a
 -- triplex over a dépanneur earns both.
 --
--- Exactly two of the inputs are measured:
+-- Most of the inputs are now measured:
 --
 --   * the dwellings and the floor area, from the roll;
---   * the rent and the vacancy, from CMHC's survey of this borough.
+--   * the dwelling rent and the vacancy, from CMHC's survey of this borough;
+--   * the office and industrial rents per square foot, from Cushman &
+--     Wakefield's MarketBeat for the submarket this borough sits in, carried
+--     to the current quarter by Statistics Canada's rent index — see sql/020.
 --
--- Everything else is stated, and `income_assumptions` carries all of it on
--- every row so a rate can always be read back against what produced it — the
--- rule silver.lot_frontage.buffer_m and gold.lot_profiles.max_built_area_m2
--- follow. The commercial and industrial rates per square foot come from
--- hbu_dataplatform's `urban_rag.program`, which is also what the development
--- solver prices a new building's floors at, so the two cannot drift apart.
--- `operating_expense_ratio` is the single largest lever on every rate in this
--- table.
+-- What is left stated is the **retail** rent, because no free survey publishes
+-- a Montreal retail level at all, and the operating expense ratio.
+-- `income_assumptions` carries every one of them on every row, with a
+-- `rent_provenance` entry per rent class saying which publisher, which quarter
+-- and whether the figure was measured, escalated or stated — so a rate can
+-- always be read back against what produced it, the rule
+-- silver.lot_frontage.buffer_m and gold.lot_profiles.max_built_area_m2 follow.
+-- `operating_expense_ratio` is now the single largest *stated* lever on every
+-- rate in this table.
+--
+-- Commerce is charged in two halves and reported as one: the CUBF's 4000s are
+-- retail and its 5000s and 6000s are offices and services, and the two rent
+-- dollars a square foot apart. `commercial_income_cad` is their sum, and
+-- `retail_income_cad` / `office_income_cad` below are the halves.
 --
 -- **Vacancy is netted per class and the expense ratio once at the end.** They
 -- are different things — income never collected against collected income that
@@ -339,3 +348,27 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the commerce split
+-- ---------------------------------------------------------------------------
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
+-- this table, so columns added after its first release arrive as an ALTER —
+-- the same shape sql/009 uses.
+--
+-- `commercial_floor_area_m2` and `commercial_income_cad` keep exactly the
+-- meaning they had; these four say what each is made of. They exist because
+-- silver.commercial_rents (sql/020) surveys retail and office *apart* — the
+-- CUBF's 4000s against its 5000s and 6000s — and the two are dollars a square
+-- foot apart in Montreal, so charging a dépanneur an office rent is a category
+-- error worth four columns to avoid.
+--
+-- Nullable with no default, like every other measure here: a lot whose units
+-- carry no retail floor has none, and one nobody could price has no income.
+-- Neither is a zero.
+ALTER TABLE silver.lot_assessment_comparables
+    ADD COLUMN IF NOT EXISTS retail_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS office_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS retail_income_cad double precision,
+    ADD COLUMN IF NOT EXISTS office_income_cad double precision;

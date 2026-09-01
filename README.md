@@ -483,15 +483,16 @@ all — the role still needs `GRANT rds_iam`, which is commented out in
 
 ### Getting the DB credentials
 
-The output of `make output` prints out the command to fetch the credentials. However some ' around the arn are required to make it work:
+Use the helper instead of pasting the RDS secret ARN. It resolves the current
+secret from SSM, fetches it from Secrets Manager, and adds `password_urlencoded`
+plus a ready-to-copy `database_url` whose password is percent-encoded:
 
+```bash
+make db-secret ENV=dev
 ```
-AWS_PROFILE=charles_gauvin_east_1 aws secretsmanager get-secret-value \
---secret-id 'arn:aws:secretsmanager:us-east-1:038083667790:secret:rds!db-d901b57d-5605-45a7-96b0-6faa2cc6568b-MeQ37g' \
---region us-east-1 \
---query SecretString \
---output text
-```
+
+For just the encoded connection URL, `make db-url ENV=dev` prints the same
+`postgresql://...` form directly.
 
 ### QGIS credentials
 
