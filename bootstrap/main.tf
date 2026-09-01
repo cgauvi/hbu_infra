@@ -157,7 +157,12 @@ variable "github_repo_immutable" {
 }
 
 locals {
-  github_deploy_branches = ["master", "main", "develop"]
+  # The branches deploy.yml actually maps to an environment: master -> prod,
+  # dev -> dev. Keep this in step with the case statement in that workflow and
+  # with its workflow_run branch filter — a branch missing here fails at
+  # "Configure AWS credentials" with "Not authorized to perform
+  # sts:AssumeRoleWithWebIdentity", which names neither the branch nor the sub.
+  github_deploy_branches = ["master", "dev"]
 }
 
 data "aws_iam_openid_connect_provider" "github" {
