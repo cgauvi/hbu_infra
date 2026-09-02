@@ -117,3 +117,34 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the two unit counts that qualify the totals
+-- ---------------------------------------------------------------------------
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
+-- this table, so a column added to it after that table's first release never
+-- arrives — `db.py init` re-runs the file happily and changes nothing. Columns
+-- added later therefore need an ALTER, the same shape sql/009 and sql/016 use.
+--
+-- These two were added to the CREATE above without one, so every database
+-- created before that edit is still missing them. That is not a cosmetic gap:
+-- gold.lot_profiles selects `assessed.num_shared_units` and
+-- `assessed.num_units_by_point`, so the whole gold partition fails to
+-- materialize with `column assessed.num_shared_units does not exist` — which
+-- reads as a bug in the profile query rather than as a table that was never
+-- widened.
+--
+-- NOT NULL DEFAULT 0 matches the CREATE exactly, and is what the counts mean:
+-- a lot no unit is shared onto has 0 shared units, not an unknown number. On
+-- PostgreSQL 11+ a default added this way is metadata only, so this does not
+-- rewrite the table however many rows it holds.
+-- `total_assessed_value_apportioned` is here for the same reason and is the
+-- one that matters most: it is the only total in this schema that may be summed
+-- across a borough, and a database missing it simply has no such column to sum.
+-- Nullable with no default, exactly as the CREATE declares it - a lot no unit
+-- stands on has no apportioned value, and that is not zero.
+ALTER TABLE silver.lot_assessed_values
+    ADD COLUMN IF NOT EXISTS num_shared_units   integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS num_units_by_point integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_assessed_value_apportioned numeric;
