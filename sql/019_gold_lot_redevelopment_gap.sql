@@ -228,3 +228,32 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what stands there, in words
+-- ---------------------------------------------------------------------------
+--
+-- An ALTER, for the reason sql/009, sql/014 and sql/016 use one.
+--
+-- `existing_dominant_use_code` beside this says 4611; this says "Garage de
+-- stationnement pour automobiles (infrastructure)". Both are the same fact
+-- about the unit carrying most of the parcel's assessed value, and only the
+-- second is readable by someone scanning a shortlist of redevelopment
+-- candidates — which is what this table is for.
+--
+-- Carried up from silver.lot_assessment_comparables, which carried it from
+-- silver.assessment_units, which merged hbu_dataplatform's `cubf_use_codes`
+-- snapshot of the MEFQ's Annexe 2C.1. Nothing on this path looks the code up a
+-- second time.
+--
+-- For reading, not for filtering — `existing_dominant_use_code` is the key and
+-- `existing_dominant_income_class` is what the screen in sql/021 sorts on. Two
+-- editions of the manual can word one code differently.
+--
+-- Null where the gap has no existing side at all: a parcel with a zoning
+-- envelope and nothing assessed on it, which is exactly what `is_underbuilt`
+-- exists to find.
+--
+-- French, as published — the manual is not issued in English.
+ALTER TABLE gold.lot_redevelopment_gap
+    ADD COLUMN IF NOT EXISTS existing_dominant_use_description text;

@@ -372,3 +372,34 @@ ALTER TABLE silver.lot_assessment_comparables
     ADD COLUMN IF NOT EXISTS office_floor_area_m2 double precision,
     ADD COLUMN IF NOT EXISTS retail_income_cad double precision,
     ADD COLUMN IF NOT EXISTS office_income_cad double precision;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what the dominant use code says
+-- ---------------------------------------------------------------------------
+--
+-- Another ALTER, for the reason the block above is one.
+--
+-- `dominant_use_code` is four digits and says nothing on its own — a lot reads
+-- 4611 and stops there. This is the MEFQ's own text for that code ("Garage de
+-- stationnement pour automobiles (infrastructure)"), read off the *same* unit
+-- the code, year and storeys are, so the four describe one property.
+--
+-- Not looked up here and not looked up by the asset either: it is carried
+-- across from silver.assessment_units, which merged hbu_dataplatform's
+-- `cubf_use_codes` snapshot onto every unit. One join, in one place, so the
+-- words beside a code are the ones that partition was described with rather
+-- than whatever edition of the manual a later reader happens to hold.
+--
+-- For reading, not for filtering: `dominant_use_code` stays the key and is what
+-- the index below serves. Two editions of the manual can word one code
+-- differently, and a query that matched on the text would quietly lose rows
+-- when the ministry re-phrases one.
+--
+-- Nullable, and null in three distinguishable ways: no unit stands on the lot,
+-- the assessor left `rl0105a` blank, or the code is one the manual does not
+-- number. Only the third is worth chasing, and hbu_dataplatform reports it as
+-- `num_use_codes_not_in_the_manual` on the assessment_units run.
+--
+-- French, as published — the manual is not issued in English.
+ALTER TABLE silver.lot_assessment_comparables
+    ADD COLUMN IF NOT EXISTS dominant_use_description text;

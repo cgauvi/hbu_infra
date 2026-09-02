@@ -558,3 +558,23 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what the dominant use code says
+-- ---------------------------------------------------------------------------
+--
+-- Another ALTER, for the reason the block of them above is one.
+--
+-- `dominant_use_code` says 4611; this says "Garage de stationnement pour
+-- automobiles (infrastructure)". Carried up from sql/016 — which carried it
+-- from sql/014, which is where hbu_dataplatform's `cubf_use_codes` snapshot of
+-- the MEFQ's Annexe 2C.1 was merged onto the unit. Nothing on that path looks
+-- a code up twice.
+--
+-- For reading, not for filtering: `dominant_use_code` stays the key. NULL is
+-- ordinary here — a lane no unit stands on, an assessor who left rl0105a
+-- blank, or a code the manual does not number.
+--
+-- French, as published — the manual is not issued in English.
+ALTER TABLE gold.lot_profiles
+    ADD COLUMN IF NOT EXISTS dominant_use_description text;

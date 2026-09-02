@@ -164,3 +164,31 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what the use code says
+-- ---------------------------------------------------------------------------
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
+-- this table, so a column added after its first release arrives as an ALTER —
+-- the same shape sql/009 and sql/016 use.
+--
+-- `use_code` is four digits and nothing published with the roll says what they
+-- mean: a unit states 4611 and the roll stops there. The MEFQ's *codes
+-- d'utilisation des biens-fonds* (Annexe 2C.1) is the list that says it is a
+-- parking garage, and hbu_dataplatform's `cubf_use_codes` asset snapshots it
+-- per scrape date. This is that text, looked up onto the unit by
+-- `assessment_units` — not a second classification, and not something to filter
+-- on in place of `use_code`, which stays the key.
+--
+-- Nullable, and the two ways it is null are worth telling apart. A unit whose
+-- `use_code` is itself null was never classified by the assessor; one with a
+-- code and no description carries a code the manual does not number, which
+-- happens because the roll and the manual are amended on their own cadences.
+-- The pipeline reports `num_use_codes_not_in_the_manual` per run and names
+-- them, so the second case is visible rather than inferred.
+--
+-- French, as published. The manual is not issued in English, so translating
+-- here would be this platform inventing a text the ministry never wrote.
+ALTER TABLE silver.assessment_units
+    ADD COLUMN IF NOT EXISTS use_description text;

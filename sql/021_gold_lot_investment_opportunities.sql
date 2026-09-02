@@ -225,3 +225,29 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what stands there, in words
+-- ---------------------------------------------------------------------------
+--
+-- An ALTER, for the reason sql/009, sql/014, sql/016 and sql/019 use one.
+--
+-- Every other column on this shortlist is something to sort or filter by. This
+-- one is not: it is the MEFQ's own text for the use code of the unit carrying
+-- most of the parcel's assessed value — "Garage de stationnement pour
+-- automobiles (infrastructure)" — and it is here because a person deciding
+-- which of twenty ranked parcels to open reads that faster than any ratio
+-- beside it.
+--
+-- The *code* it describes is deliberately not carried here. It is one join
+-- away on lot_uid in gold.lot_redevelopment_gap, like the forty other columns
+-- this table leaves there, and `existing_dominant_income_class` above is what
+-- the screen in this file actually sorts on. Do not filter on this text: two
+-- editions of the manual can word one code differently.
+--
+-- Null where the gap had no existing side — a parcel with an envelope and
+-- nothing assessed on it, which is the case `is_underbuilt` exists to find.
+--
+-- French, as published — the manual is not issued in English.
+ALTER TABLE gold.lot_investment_opportunities
+    ADD COLUMN IF NOT EXISTS existing_dominant_use_description text;
