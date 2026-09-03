@@ -35,9 +35,38 @@ SET search_path TO rag, public;
 -- clipping a neighbour's zone by 8 cm has a second one that is a survey
 -- artifact. Ranked per (lot, source_table): the ranking is meaningless across
 -- layers, which overlap each other freely.
+--
+-- It is *not* ranked across snapshots, and does not need to be:
+-- `rag.lots.lot_uid` is a surrogate under UNIQUE (lot_number, scrape_date), so
+-- one lot_uid is one lot on one date and the window already sits inside a
+-- single snapshot. A caller filtering by `lot_number` rather than by lot_uid
+-- is the one that spans them, and gets a rank 1 per date - which is why
+-- `search_at_lot_number` below resolves the newest snapshot's lot first.
+--
+-- `overlap_area_m2` is carried alongside `pct_of_lot` because the two answer
+-- different questions and only one of them can answer this: how much of a lot
+-- a zone *should* govern before it counts is a judgement, and a percentage
+-- states it; whether a zone covers the lot at all is not, and below about a
+-- square metre the answer is no whatever the parcel's size. That is the
+-- cadastre and the zoning layer being drawn by two offices whose lines miss
+-- each other by centimetres along every lot line - a survey disagreement
+-- wearing a zone's number, not a small amount of governing. The column is on
+-- the view rather than the cutoff being applied here, for the reason
+-- 005_silver_lot_features.sql gives for not thresholding at all: the cutoff
+-- belongs to the question being asked. hbu_dataplatform's
+-- `postgis.MIN_ZONE_OVERLAP_M2` and hbu_rag_map's `queries.MIN_ZONE_OVERLAP_M2`
+-- are the same square metre applied at the two ends that ask it.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE VIEW rag.lot_documents AS
+-- Dropped rather than replaced, for one reason and only this one: CREATE OR
+-- REPLACE VIEW may append columns but may not insert one, and
+-- `overlap_area_m2` belongs beside `pct_of_lot` rather than after the document
+-- columns. Without CASCADE on purpose - nothing depends on this view today
+-- (gold.lot_profiles is a table the pipeline fills, not a dependent), and if
+-- something ever does, failing loudly here beats dropping it silently.
+DROP VIEW IF EXISTS rag.lot_documents;
+
+CREATE VIEW rag.lot_documents AS
     WITH documents AS (
         SELECT DISTINCT
                doc_id, url, title, source_table, neighborhood,
@@ -51,6 +80,7 @@ CREATE OR REPLACE VIEW rag.lot_documents AS
            lf.source_table,
            lf.feature_id,
            lf.pct_of_lot,
+           lf.overlap_area_m2,
            rank() OVER (
                PARTITION BY lf.lot_uid, lf.source_table
                ORDER BY lf.pct_of_lot DESC
@@ -77,16 +107,32 @@ CREATE OR REPLACE VIEW rag.lot_documents AS
 -- this one takes the lot number - which is what a user actually has - and
 -- reads the join back out of silver.lot_features instead of recomputing it.
 --
--- `min_pct_of_lot` is the sliver cutoff, defaulted to 0 so the answer includes
+-- Two cutoffs, and the defaults differ because they are different in kind.
+--
+-- `min_pct_of_lot` is the judgement, defaulted to 0 so the answer includes
 -- everything unless the caller says otherwise. 1.0 is a reasonable value once
 -- the misalignment between cadastre and zoning is the thing being filtered.
+--
+-- `min_overlap_m2` is the artefact filter, and defaults to 1 because there is
+-- no threshold a caller could sensibly read it back at: under a square metre
+-- the two publishers' lines have simply missed each other, and the grid that
+-- comes back is the block next door's. Pass 0 to get the old behaviour.
 -- ---------------------------------------------------------------------------
+
+-- The signature gains an argument, so the old one has to go explicitly:
+-- CREATE OR REPLACE FUNCTION matches on the argument list and would leave a
+-- second five-argument overload behind, which the ownership block below then
+-- names ambiguously.
+DROP FUNCTION IF EXISTS rag.search_at_lot_number(
+    vector, text, integer, double precision, text
+);
 
 CREATE OR REPLACE FUNCTION rag.search_at_lot_number (
     query_embedding vector,
     in_lot_number   text,
     match_count     integer DEFAULT 5,
     min_pct_of_lot  double precision DEFAULT 0,
+    min_overlap_m2  double precision DEFAULT 1,
     on_source_table text DEFAULT NULL
 )
 RETURNS TABLE (
@@ -119,6 +165,7 @@ AS $$
           FROM lot
           JOIN silver.lot_features lf USING (lot_uid)
          WHERE lf.pct_of_lot >= min_pct_of_lot
+           AND lf.overlap_area_m2 >= min_overlap_m2
            AND (on_source_table IS NULL OR lf.source_table = on_source_table)
     )
     SELECT a.lot_number,
@@ -153,7 +200,7 @@ BEGIN
     EXECUTE format('ALTER VIEW rag.lot_documents OWNER TO %I', app_role);
     EXECUTE format(
         'ALTER FUNCTION rag.search_at_lot_number(vector, text, integer,'
-        ' double precision, text) OWNER TO %I', app_role);
+        ' double precision, double precision, text) OWNER TO %I', app_role);
 
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ro_role) THEN
         EXECUTE format('GRANT SELECT ON rag.lot_documents TO %I', ro_role);
