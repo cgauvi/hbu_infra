@@ -166,6 +166,10 @@ CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
     -- 01-283, applied in solve_program and restated here as a fact about the
     -- row rather than something a reader has to know the by-law to see.
     underground_area_m2   double precision NOT NULL DEFAULT 0,
+    -- garage_stalls * the bay allowance in program_assumptions. Inside
+    -- gross_floor_area_m2, unlike underground_area_m2 beside it — which is the
+    -- whole difference between parking in the ground floor and under it.
+    garage_area_m2        double precision NOT NULL DEFAULT 0,
     residential_floors           integer NOT NULL DEFAULT 0,
     commercial_floors            integer NOT NULL DEFAULT 0,
     industrial_floors            integer NOT NULL DEFAULT 0,
@@ -173,6 +177,18 @@ CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
     underground_levels           integer NOT NULL DEFAULT 0,
     underground_stalls           integer NOT NULL DEFAULT 0,
     above_grade_stalls           integer NOT NULL DEFAULT 0,
+    -- Stalls standing on the yard the footprint leaves. Neither a storey nor
+    -- superficie de plancher, because they are not in a building at all —
+    -- what Taux d'implantation caps is the plate, and the rest of the parcel
+    -- is ground. They are in total_stalls and in parking_cost_cad, and they
+    -- are deliberately absent from floor_stack, which is a stack of storeys.
+    surface_stalls               integer NOT NULL DEFAULT 0,
+    -- Enclosed bays inside the building's own ground floor. Unlike every other
+    -- stall here this one IS superficie de plancher: it is inside
+    -- gross_floor_area_m2, the density cap counts it, and Taux d'implantation
+    -- counts the plate it sits under — but it is not a storey, so En etage
+    -- does not. garage_area_m2 is how much floor it took from the dwellings.
+    garage_stalls                integer NOT NULL DEFAULT 0,
     total_stalls                 integer NOT NULL DEFAULT 0,
 
     -- -- what it costs to build, in dollars (capital, not amortised) --------
@@ -291,6 +307,37 @@ CREATE INDEX IF NOT EXISTS lot_development_programs_npv_idx
 -- row, solved or not, and an unsolved one stacks nothing.
 ALTER TABLE silver.lot_development_programs
     ADD COLUMN IF NOT EXISTS floor_stack jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+-- The third place a stall can go, added when it turned out the solver had only
+-- ever known the two that cost a storey or a hole: a parkade stall is $60 300
+-- or $48 125 and a stall on the yard is $6 105, so on any parcel with ground
+-- to spare the structured pair was pricing parking seven to ten times over
+-- what gets built. Where that bit hardest was the low-density end — a grid printing H.1,
+-- En etage 1/1 and Taux d'implantation 35 % permits one dwelling on one
+-- storey, so no second dwelling shares the stall and the single permitted
+-- storey is the dwelling's own. That left digging as the only provision, one
+-- dwelling does not earn back a parkade stall, and the optimum became to build
+-- nothing: parcels zoned for a house came back as 0 m² and 0 dwellings.
+--
+-- 0 on a partition written before the column existed, which is also the honest
+-- value there — those solves had no surface option to exercise.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS surface_stalls integer NOT NULL DEFAULT 0;
+
+-- The fourth place, added with the third: a closed garage in the ground floor.
+-- It is the one provision that is inside the building without being a storey of
+-- it, so it answers to Densite and to Taux d'implantation and not to En etage,
+-- and what it really costs is the floor area it takes from the dwellings —
+-- which is why garage_area_m2 travels beside the count. Priced at a garage
+-- shell rather than at a parkade: the Altus guide has no rate for a bay in a
+-- house, and charging one a $48 125 parkade stall for a garage door is how a
+-- bungalow stops penciling.
+--
+-- 0 on a partition written before the columns existed, which is also the honest
+-- value there — those solves had no garage to build.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS garage_stalls integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS garage_area_m2 double precision NOT NULL DEFAULT 0;
 
 DO $$
 DECLARE

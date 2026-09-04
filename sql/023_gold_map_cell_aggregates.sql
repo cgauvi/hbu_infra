@@ -32,11 +32,19 @@
 --   * At Z + 4 a cell is 256/16 = 16 screen pixels. Coarse enough to be a
 --     texture, fine enough that the borough's shape is still legible in it.
 --
--- Levels 15 through 19 are built for every layer, uniformly, rather than only
+-- Levels 1 through 19 are built for every layer, uniformly, rather than only
 -- the levels each layer's gate needs. The gates live in hbu_rag_map and change
 -- when somebody tunes what is legible; making this table depend on them would
 -- mean a re-materialisation of every borough to move one number in a different
--- repository.
+-- repository. 15..19 is what the map reads today (display zooms 11..15);
+-- everything coarser is there so that lowering that floor is a one-line change
+-- over there rather than a rebuild here.
+--
+-- The coarse levels cost almost no rows - each holds a quarter of the cells of
+-- the one below - but they are not free: a borough fits inside a single cell
+-- from around level 11 down, so every level below that stores another copy of
+-- its whole dissolved union. See the note in urban_rag.postgis on why those
+-- copies are stored intact rather than simplified.
 --
 -- ---------------------------------------------------------------------------
 -- Two assignments, and both of them are additive
@@ -105,7 +113,7 @@ CREATE TABLE IF NOT EXISTS gold.map_cell_aggregates (
     -- 'lots' — and one indirection is enough.
     layer        text NOT NULL,
 
-    -- The Web Mercator tile that *is* this cell. `cell_z` runs 15..19; the map
+    -- The Web Mercator tile that *is* this cell. `cell_z` runs 1..19; the map
     -- serves display zoom Z from cell_z = Z + 4. See the header for why that
     -- offset is the bound on tile size rather than a preference.
     cell_z       smallint NOT NULL,
@@ -143,6 +151,13 @@ CREATE TABLE IF NOT EXISTS gold.map_cell_aggregates (
     -- borough" — a cell beyond the boundary has no coverage at all, and a
     -- park has coverage with no buildings on it.
     dissolved_area_m2 double precision,
+    -- The same clip measured as linework. Taken on every layer rather than on
+    -- `streets` alone, because PostGIS already answers the question a branch
+    -- here would ask: ST_Area of linework is 0 and ST_Length of an areal
+    -- geometry is 0, so the four polygon layers report an area and no length
+    -- and `streets` the reverse. It is the numerator of that layer's
+    -- `street_km_per_km2` — see `urban_rag.tile_grid.UNIVERSAL_MEASURES`.
+    dissolved_length_m double precision,
     cell_area_m2      double precision,
     coverage_pct      double precision,
 
@@ -166,6 +181,24 @@ CREATE TABLE IF NOT EXISTS gold.map_cell_aggregates (
     loaded_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scrape_date, neighborhood, layer, cell_z, cell_x, cell_y)
 ) PARTITION BY LIST (neighborhood);
+
+-- ---------------------------------------------------------------------------
+-- Widening an existing table
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already holds
+-- gold.map_cell_aggregates, so a column added after this file first ran has to
+-- arrive as an ALTER here too, the way sql/009 spells out. It goes ahead of
+-- the indexes, in case one of them is ever on a column it adds.
+-- ---------------------------------------------------------------------------
+
+-- Declared one release late. `urban_rag.postgis.MAP_CELL_COLUMNS` has written
+-- this column since the asset's first run and the CREATE TABLE above did not
+-- declare it, so a materialisation against an already-created table failed on
+-- the staging copy (`LIKE gold.map_cell_aggregates`) rather than on a number.
+-- NULL on existing rows is the truth about them until their partition is
+-- recomputed.
+ALTER TABLE gold.map_cell_aggregates
+    ADD COLUMN IF NOT EXISTS dissolved_length_m double precision;
 
 -- The tile read, and the only one that matters for latency: "every cell of
 -- this layer at this level inside this envelope". Leading on (layer, cell_z)

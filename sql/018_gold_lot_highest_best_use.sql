@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     commercial_area_m2    double precision,
     industrial_area_m2    double precision,
     underground_area_m2   double precision,
+    garage_area_m2        double precision,
     residential_floors           integer,
     commercial_floors            integer,
     industrial_floors            integer,
@@ -132,6 +133,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     underground_levels           integer,
     underground_stalls           integer,
     above_grade_stalls           integer,
+    -- On the yard rather than in the building. See sql/017.
+    surface_stalls               integer,
+    -- In the ground floor rather than on a storey of its own. See sql/017.
+    garage_stalls                integer,
     total_stalls                 integer,
     construction_cost_cad  double precision,
     commercial_cost_cad    double precision,
@@ -202,6 +207,15 @@ CREATE INDEX IF NOT EXISTS lot_highest_best_use_dominant_use_idx
 -- says which of the two a null is.
 ALTER TABLE gold.lot_highest_best_use
     ADD COLUMN IF NOT EXISTS floor_stack jsonb;
+
+-- Carried up from sql/017 with the rest of the chosen program. Nullable here
+-- and NOT NULL there for the same reason floor_stack is: a lot with no program
+-- has no stall count either, and 0 would read as "parks nothing" where the
+-- honest value is "nothing was chosen".
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS surface_stalls integer,
+    ADD COLUMN IF NOT EXISTS garage_stalls integer,
+    ADD COLUMN IF NOT EXISTS garage_area_m2 double precision;
 
 DO $$
 DECLARE
