@@ -49,6 +49,25 @@
 -- tried are in the asset's own metadata.
 --
 -- ---------------------------------------------------------------------------
+-- The parking is not in this table's geometry, on purpose
+-- ---------------------------------------------------------------------------
+--
+-- A program can park on the ground — `surface_stalls` standing on the yard the
+-- footprint leaves — and none of that asphalt is in `geom`. A surface stall is
+-- not a building: no floor area, no storey, no height. Folding it into the
+-- massing rectangle would inflate the very footprint `footprint_fit_pct` is
+-- checking, and a map extruding that rectangle to `height_m` would raise a
+-- solid where there is a parking lot.
+--
+-- So the same asset draws a *second* polygon and publishes it to
+-- gold.lot_surface_parking (sql/024), fitted into the **parcel** less this
+-- building rather than into the setback envelope — a margin is what a
+-- *building* keeps, and a car in a side or rear yard stands exactly where the
+-- margin said no building may go. The columns at the end of this table are
+-- that answer without its shape, so "does this building's parking fit on this
+-- lot" is one row rather than a join.
+--
+-- ---------------------------------------------------------------------------
 -- Every lot keeps a row in the tree; only the drawn ones are here
 -- ---------------------------------------------------------------------------
 --
@@ -144,6 +163,27 @@ CREATE TABLE IF NOT EXISTS gold.lot_building_massing (
     loaded_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scrape_date, neighborhood, lot_uid)
 ) PARTITION BY LIST (neighborhood);
+
+-- The parking, summarised. The polygon itself is in gold.lot_surface_parking
+-- (sql/024) and deliberately not here: a surface stall is not a building — no
+-- floor area, no storey, no height — so folding it into `geom` would inflate
+-- the footprint footprint_fit_pct is checking and would have a map extrude a
+-- solid where there is asphalt. What is here is the answer without the shape,
+-- so "does this building's parking fit on this lot" needs no join.
+--
+-- surface_parking_fit_pct is footprint_fit_pct's counterpart and reads the
+-- same way: 100 means the yard took the whole reservation once the building
+-- was on it, and less means the program is counting on stalls the ground will
+-- not give it. parking_status distinguishes a lot that came up short from one
+-- that parks underground and from one whose parcel was never loaded — see the
+-- asset's PARKING_STATUSES.
+ALTER TABLE gold.lot_building_massing
+    ADD COLUMN IF NOT EXISTS parking_status text,
+    ADD COLUMN IF NOT EXISTS surface_stalls integer,
+    ADD COLUMN IF NOT EXISTS placed_surface_stalls double precision,
+    ADD COLUMN IF NOT EXISTS surface_parking_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS placed_surface_parking_m2 double precision,
+    ADD COLUMN IF NOT EXISTS surface_parking_fit_pct double precision;
 
 -- The map read: "every massing in this bounding box". The reason this table is
 -- spatial at all.

@@ -217,6 +217,72 @@ ALTER TABLE gold.lot_highest_best_use
     ADD COLUMN IF NOT EXISTS garage_stalls integer,
     ADD COLUMN IF NOT EXISTS garage_area_m2 double precision;
 
+-- The ground the surface stalls take, and the shape of the ground there was to
+-- take it from — see sql/017, which states both at length.
+--
+-- surface_area_m2 is nullable here and NOT NULL there for the reason every
+-- carried program column is: a lot with no program reserved no yard, and 0
+-- would read as "parks nothing on the ground" where the honest value is
+-- "nothing was chosen". It is the number gold.lot_building_massing draws a
+-- rectangle of, so it is carried up rather than recomputed from the stall
+-- count — a caller who moved the per-stall allowance would otherwise have the
+-- drawing and the solve disagree.
+--
+-- parkable_area_m2 belongs to the *parcel* rather than to the chosen envelope,
+-- so unlike its neighbours it is on every row, including the lots with no
+-- program at all. A lot reporting 0 here is one no car can stand on, whatever
+-- else is true of it.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS surface_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS parkable_area_m2 double precision;
+
+-- The sous-sol, added when the solver stopped treating everything below grade
+-- as parking. Article 38 1 of by-law 01-283 excludes *une aire de
+-- stationnement des vehicules [...] situee en sous-sol, de meme que leurs
+-- voies d'acces* from the superficie de plancher and excludes nothing else, so
+-- a below-grade level of dwellings or of shops is floor area the density index
+-- counts, while the parkade under it is not. Both are below grade; only one is
+-- charged, and that is the whole of the distinction these columns carry.
+--
+-- What Densite is tested against is therefore density_floor_area_m2 =
+-- gross_floor_area_m2 + basement_area_m2, and NOT gross_floor_area_m2 alone
+-- any more. That column keeps its old meaning exactly - footprint_m2 times the
+-- storeys above grade - because it is what a massing extrudes and what
+-- gold.lot_building_massing measures its placed area against; the cap moved to
+-- the wider column beside it rather than into it.
+--
+-- Neither storey cap sees any of this. En etage counts a building's storeys
+-- and a below-grade level is not one; Hauteur en metre is measured from grade
+-- up. So floors and height_m are unchanged by a cellar, and
+-- basement_*_levels are counted apart from them. Nor is the footprint: the
+-- basement is modelled flat under the building above it - one plate, the same
+-- plate - so Taux d'implantation has nothing further to say about it.
+--
+-- basement_dwellings is the part of num_dwellings that stands in the cellar.
+-- It is counted separately because it is priced separately: dearer to build by
+-- program_assumptions ->> 'below_grade_cost_premium' and leased under the
+-- storeys above it by 'below_grade_rent_discount_pct'. That is the one place
+-- the solver says which level a dwelling is on, and it says it because the two
+-- rates differ.
+--
+-- 'basement_levels_allowed' in program_assumptions is how many below-grade
+-- levels of usage the run permitted where a column's *Niveaux de batiment
+-- autorises* rows authorise any - a modelling bound like max_underground_levels
+-- beside it, not a norm the grid prints. binding names 'basement_levels' where
+-- the cellar is spent and 'basement_unbuilt' where the level rows allow one
+-- and the arithmetic declined to build it.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS density_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_residential_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_commercial_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_industrial_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_residential_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_commercial_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_industrial_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_dwellings integer;
+
 DO $$
 DECLARE
     app_role text := 'urban_rag';

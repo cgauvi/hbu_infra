@@ -149,7 +149,11 @@ CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
     footprint_m2      double precision NOT NULL DEFAULT 0,
     -- footprint_m2 * (residential_floors + above_grade_parking_floors +
     -- commercial_floors + industrial_floors) — the superficie de plancher
-    -- Densite is tested against. Underground is not in it; see
+    -- ABOVE GRADE, and the number a massing extrudes. It is no longer the
+    -- whole of what Densite is tested against: a cellar of usage is floor area
+    -- too, so that cap answers to density_floor_area_m2 = this plus
+    -- basement_area_m2 — both added at the foot of this file, where the
+    -- distinction is written out. Underground *parking* is in neither; see
     -- underground_area_m2 below.
     gross_floor_area_m2   double precision NOT NULL DEFAULT 0,
     -- footprint_m2 * residential_floors — the plate, not the unit schedule.
@@ -338,6 +342,85 @@ ALTER TABLE silver.lot_development_programs
 ALTER TABLE silver.lot_development_programs
     ADD COLUMN IF NOT EXISTS garage_stalls integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS garage_area_m2 double precision NOT NULL DEFAULT 0;
+
+-- The ground those surface stalls actually take, and the shape of the ground
+-- there was to take it from. Added together because they are two halves of the
+-- same correction.
+--
+-- surface_area_m2 is what the model reserved on the yard — stall count times
+-- the 300 sq ft allowance, at the hundredth of a square metre the solver holds
+-- areas to. It is floor area of no kind: not in gross_floor_area_m2, not in
+-- footprint_m2, and not under the building the way underground_area_m2 is.
+-- That is the whole of what a surface stall is, and it is why
+-- gold.lot_surface_parking (sql/024) draws it as a polygon of its own instead
+-- of the massing folding it in.
+--
+-- parkable_area_m2 is the parcel measured rather than the program solved: the
+-- largest parking-shaped rectangle — at least 5.5 m deep, a stall's length in
+-- article 566 of by-law 01-283, and at least 2.6 m across — that fits inside
+-- the lot boundary. It is an input to the solve and not an output of it, and
+-- it exists because the constraint it stands beside is an area against an
+-- area. `surface_stall_area × stalls + footprint <= lot area` is satisfied on
+-- a parcel two metres wide, where no car stands in any orientation, so the
+-- cheapest stall in the model was being spent on land that cannot take it —
+-- and being cheapest, it was spent first and everywhere.
+--
+-- Both are measured off the cadastre in Python (urban_rag.massing), so a
+-- partition whose run could not reach rag.lots has parkable_area_m2 NULL and
+-- its stalls bounded on area alone, which is what every run did before this.
+-- NULL is "nobody measured"; 0 is "measured, and no car stands here".
+-- binding names surface_parking_shape on the rows where the shape is what
+-- stopped the surface stalls.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS surface_area_m2 double precision NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS parkable_area_m2 double precision;
+
+-- The sous-sol, added when the solver stopped treating everything below grade
+-- as parking. Article 38 1 of by-law 01-283 excludes *une aire de
+-- stationnement des vehicules [...] situee en sous-sol, de meme que leurs
+-- voies d'acces* from the superficie de plancher and excludes nothing else, so
+-- a below-grade level of dwellings or of shops is floor area the density index
+-- counts, while the parkade under it is not. Both are below grade; only one is
+-- charged, and that is the whole of the distinction these columns carry.
+--
+-- What Densite is tested against is therefore density_floor_area_m2 =
+-- gross_floor_area_m2 + basement_area_m2, and NOT gross_floor_area_m2 alone
+-- any more. That column keeps its old meaning exactly - footprint_m2 times the
+-- storeys above grade - because it is what a massing extrudes and what
+-- gold.lot_building_massing measures its placed area against; the cap moved to
+-- the wider column beside it rather than into it.
+--
+-- Neither storey cap sees any of this. En etage counts a building's storeys
+-- and a below-grade level is not one; Hauteur en metre is measured from grade
+-- up. So floors and height_m are unchanged by a cellar, and
+-- basement_*_levels are counted apart from them. Nor is the footprint: the
+-- basement is modelled flat under the building above it - one plate, the same
+-- plate - so Taux d'implantation has nothing further to say about it.
+--
+-- basement_dwellings is the part of num_dwellings that stands in the cellar.
+-- It is counted separately because it is priced separately: dearer to build by
+-- program_assumptions ->> 'below_grade_cost_premium' and leased under the
+-- storeys above it by 'below_grade_rent_discount_pct'. That is the one place
+-- the solver says which level a dwelling is on, and it says it because the two
+-- rates differ.
+--
+-- 'basement_levels_allowed' in program_assumptions is how many below-grade
+-- levels of usage the run permitted where a column's *Niveaux de batiment
+-- autorises* rows authorise any - a modelling bound like max_underground_levels
+-- beside it, not a norm the grid prints. binding names 'basement_levels' where
+-- the cellar is spent and 'basement_unbuilt' where the level rows allow one
+-- and the arithmetic declined to build it.
+ALTER TABLE silver.lot_development_programs
+    ADD COLUMN IF NOT EXISTS density_floor_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_residential_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_commercial_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_industrial_area_m2 double precision,
+    ADD COLUMN IF NOT EXISTS basement_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_residential_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_commercial_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_industrial_levels integer,
+    ADD COLUMN IF NOT EXISTS basement_dwellings integer;
 
 DO $$
 DECLARE
