@@ -129,7 +129,10 @@ CREATE INDEX IF NOT EXISTS zoning_grid_columns_solvable_idx
 --
 -- Keyed on (lot_uid, feature_id, column_index): one candidate envelope per
 -- (lot, zone, column). A lot straddling two zones legitimately has entries
--- from both, which is why the zone is in the key and not assumed.
+-- from both, which is why the zone is in the key and not assumed — and since
+-- silver.lot_zone_pieces (sql/025) that is more than a key's worth of
+-- pedantry: both zones are now solved, over their own ground and against
+-- their own street, instead of the best-covered one answering for the parcel.
 --
 -- `lot_uid` rather than `lot_number` in the key, unlike gold.lot_profiles: the
 -- upstream join this is built from is keyed on the surrogate, and the number
@@ -144,13 +147,36 @@ CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     column_index integer NOT NULL,
     lot_number   text,
     source_table text,
-    lot_area_m2  double precision,
 
-    -- -- what the lot faces ------------------------------------------------
+    -- -- the ground this row is about ---------------------------------------
     --
-    -- Pivoted from silver.lot_frontage, and here rather than only on the
-    -- profile because `meets_min_lot_width` below is decided against it: an
-    -- envelope is a claim about a *site*, and the site's width is half of it.
+    -- Both, always, and they are not the same column. `lot_area_m2` is the
+    -- whole parcel; `piece_area_m2` is the ground *this zone* governs, from
+    -- silver.lot_zone_pieces, and it is what urban_rag.program sizes a
+    -- building on. On the great majority of rows one zone covers the parcel
+    -- whole and the two are equal — the rows where they differ are the ones
+    -- this pair exists for. Lot 1 740 794 is 27 044 m² with 24 596 in H04-072
+    -- and 2 440 in C04-083, and the eight storeys H04-072 permits used to be
+    -- priced over all of it.
+    lot_area_m2   double precision,
+    piece_area_m2 double precision,
+
+    -- How many zones cut this lot, where this piece ranks among them by area,
+    -- and whether it is the largest. `is_primary_zone` is the row a reader
+    -- wanting one answer per parcel takes; `num_lot_zones > 1` is how they
+    -- know to expect more than one.
+    num_lot_zones   integer,
+    zone_rank       integer,
+    is_primary_zone boolean,
+
+    -- -- what the piece faces ----------------------------------------------
+    --
+    -- silver.lot_frontage's edges cut to this piece and re-ranked inside it —
+    -- **not** the lot's ranking. `meets_min_lot_width` below is decided
+    -- against it: an envelope is a claim about a *site*, and the site's width
+    -- is half of it. On a split parcel the pieces can face different streets,
+    -- which is exactly the case on 1 740 794: the C04-083 strip has the 19.8 m
+    -- of Jarry and the H04-072 remainder behind it has 15.2 m of D'Hérelle.
     primary_frontage_m    double precision,
     primary_street_name   text,
     primary_cote_rue_id   text,
@@ -158,18 +184,37 @@ CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     secondary_street_name text,
     secondary_cote_rue_id text,
     num_frontages         integer,
+    -- The whole parcel's street, for the reader asking how much of it this
+    -- piece got.
+    lot_frontage_m        double precision,
     frontage_buffer_m     double precision,
+
+    -- -- what already stands on the piece -----------------------------------
+    --
+    -- The footprint measured on this ground, and the two shares that divide
+    -- the lot's assessment between its pieces: `footprint_share` for
+    -- everything the building is or earns, `area_share` for the ground. Both
+    -- sum to 1 across a lot's pieces. gold.lot_redevelopment_gap is the
+    -- reader; see sql/025 for why there are two.
+    existing_footprint_m2 double precision,
+    area_share            double precision,
+    footprint_share       double precision,
+    footprint_share_basis text,
 
     -- -- how much of the lot this zone covers ------------------------------
     --
-    -- The row exists because the zone covers at least `min_pct_of_lot` of the
-    -- parcel; the figure travels so a reader can raise that cutoff without
-    -- recomputing anything.
-    pct_of_lot      double precision,
-    overlap_area_m2 double precision,
-    doc_id          text,
-    url             text,
-    grid_zone       text,
+    -- The row exists because the zone covers at least `min_pct_of_lot` and
+    -- `min_overlap_m2` of the parcel, or `min_piece_area_m2` of ground
+    -- outright; the three travel so a reader can raise a cutoff without
+    -- recomputing anything. They are silver.lot_zone_pieces' decision now,
+    -- carried through — see sql/025.
+    pct_of_lot        double precision,
+    min_pct_of_lot    double precision,
+    min_overlap_m2    double precision,
+    min_piece_area_m2 double precision,
+    doc_id            text,
+    url               text,
+    grid_zone         text,
 
     -- -- what the column states --------------------------------------------
     --
@@ -272,3 +317,31 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what the grid states once for the zone, below *Patrimoine*
+-- ---------------------------------------------------------------------------
+--
+-- The parser used to stop reading at the *Patrimoine* row, because everything
+-- under it is stated once for the zone rather than per column and its
+-- full-width values would have been read as columns. It now reads four of
+-- those rows as zone-level text and repeats them on every column of the grid:
+--
+--   * heritage_sector   - *Secteur d'interet patrimonial*: 'Oui' where the
+--                         zone is one (148 of VSMPE's 632 grids), else NULL
+--   * piia_sector       - *PIIA (secteur)*: the sector number of the
+--                         borough's discretionary PIIA by-law, else NULL
+--   * pae               - *PAE*: 'Oui' under a plan d'amenagement d'ensemble
+--   * specific_articles - *Articles vises*: the dispositions particulieres of
+--                         by-law 01-283 the zone cites, as printed
+--
+-- They are what gold.lot_investment_opportunities reads to keep a building in
+-- a heritage sector out of the teardown and brownfield theses, and to mark a
+-- PIIA review on the rest - see that table's header. ADD COLUMN IF NOT EXISTS
+-- for the reason the block above uses it: a column added ahead of the code
+-- that fills it is left NULL rather than overwritten.
+ALTER TABLE silver.zoning_grid_columns
+    ADD COLUMN IF NOT EXISTS heritage_sector   text,
+    ADD COLUMN IF NOT EXISTS piia_sector       text,
+    ADD COLUMN IF NOT EXISTS pae               text,
+    ADD COLUMN IF NOT EXISTS specific_articles text;

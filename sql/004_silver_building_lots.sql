@@ -15,6 +15,33 @@
 -- 003_warehouse.sql for the partitioning and the upsert this table's primary
 -- key exists to serve.
 --
+-- "The lot(s) it actually falls in" is a screen, not a description, and it is
+-- applied on the way in rather than left to each reader. BDOI draws a terrace
+-- or a shopping strip as one contiguous outline running straight through the
+-- party walls, so clipping it to the cadastre is what gives each parcel its own
+-- house — and the same clip hands each parcel the few square metres of its
+-- neighbour's house that fall on this side of a lot line the two surveys draw
+-- differently. A party wall exactly on the line clips to a line or a point and
+-- is dropped for having no dimension; a wall a hand's breadth over it clips to
+-- a thin polygon that has area and is still the house next door.
+-- postgis.MIN_BUILDING_OVERLAP_M2 and MIN_BUILDING_PCT_OF_BUILDING are what
+-- drop the second kind, and they are an *or*: a slice is kept if it is large
+-- enough to be a building, or is enough of its own footprint to be one. See
+-- those constants for why that is not the *and* the zone cutoffs in
+-- 005_silver_lot_features.sql use, and why the difference matters.
+--
+-- So this table is thresholded rather than faithful, and that is the one place
+-- the two silver joins deliberately differ. A zone sliver is a real overlap
+-- whose significance depends on the question, and each reader of lot_features
+-- asks a different one; a sliver of the neighbour's wall is not a building on
+-- this lot under any question, and no reader here wants it. hbu_rag_map applies
+-- the identical cutoffs in the fallbacks it answers from before this table is
+-- built (queries._BUILDING_CLIP_SCREEN), which is what keeps those rows and
+-- these the same set.
+--
+-- Changing either cutoff means recomputing the affected partitions, since the
+-- rows below the cutoff are not here to be read back at another one.
+--
 -- ---------------------------------------------------------------------------
 -- Moved from rag.building_lots
 -- ---------------------------------------------------------------------------

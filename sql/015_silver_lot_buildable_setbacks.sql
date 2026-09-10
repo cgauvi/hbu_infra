@@ -44,9 +44,36 @@
 -- rag.lots and the street edge is already in silver.lot_frontage, so the
 -- proxy buys nothing the geometry does not give outright.
 --
--- What is done instead is a *directional* subtraction. The lot's own boundary
--- is sorted into four classes, each is buffered by the margin that governs it,
--- and the union of those buffers is differenced out of the parcel:
+-- ---------------------------------------------------------------------------
+-- Whose ground the margins come off, and whose ground the answer is on
+-- ---------------------------------------------------------------------------
+--
+-- Two different questions, and since silver.lot_zone_pieces (sql/025) they get
+-- two different answers on the same row.
+--
+-- A margin is a setback from a *lot line*, so it is subtracted from the
+-- parcel's own boundary. A zoning boundary running through the middle of a
+-- large parcel is not a lot line and takes nothing off — nobody has to leave
+-- six metres clear where their H zone meets their own C zone.
+--
+-- What the zone decides is where its rules apply at all, and that is an
+-- intersection, applied after the carve: the buildable envelope of a (lot,
+-- zone, column) row is the parcel less that column's four margins, clipped to
+-- the piece that zone governs. So lot 1 740 794 comes back as two envelopes
+-- that do not overlap — 24 596 m² carved under H04-072's margins and 2 440 m²
+-- under C04-083's — rather than as two copies of the whole 27 044 m², which is
+-- what it used to be and what double-counted the buildable area of every split
+-- parcel in the borough. `coverage_cap_m2` follows the same reading: *Taux
+-- d'implantation au sol* is charged against the ground its own column governs.
+--
+-- A column whose zone governs no piece of a lot gets no row here at all. That
+-- is sql/025's sliver cutoff arriving: a buildable envelope for a zone
+-- covering a square centimetre of a parcel is an envelope nobody may build in.
+--
+-- What is done for the margins themselves is a *directional* subtraction. The
+-- lot's own boundary is sorted into four classes, each is buffered by the
+-- margin that governs it, and the union of those buffers is differenced out of
+-- the parcel:
 --
 --   front      silver.lot_frontage.geom at frontage_rank = 1 — the boundary
 --              that was measured as running along the street, not a line
@@ -132,7 +159,16 @@ CREATE TABLE IF NOT EXISTS silver.lot_buildable_setbacks (
     -- makes: lot_uid is a bigserial load_lots mints again every time.
     lot_number   text,
     source_table text,
-    lot_area_m2  double precision,
+    -- The whole parcel, and the ground this zone governs. The carve below is
+    -- clipped to the second — see the header on where the margins come from —
+    -- so `piece_area_m2` is what `coverage_cap_m2` and `buildable_pct_of_lot`
+    -- are taken against. Equal on every lot one zone covers whole.
+    lot_area_m2   double precision,
+    piece_area_m2 double precision,
+    -- How many zones cut this lot. 1 on almost every row; > 1 is the reader's
+    -- signal that the parcel's buildable area is the sum of several rows and
+    -- not any one of them.
+    num_lot_zones integer,
 
     -- -- the boundary, as it was sorted ------------------------------------
     --
@@ -172,11 +208,13 @@ CREATE TABLE IF NOT EXISTS silver.lot_buildable_setbacks (
     -- narrower than twice its side margin has nowhere to put a building, and
     -- that is the fact the row exists to record.
     buildable_area_m2    double precision NOT NULL,
+    -- Of `piece_area_m2`, which is what the carve is clipped to. The name is
+    -- kept because on the great majority of rows the piece *is* the lot.
     buildable_pct_of_lot double precision,
 
-    -- *Taux d'implantation au sol max* × lot_area_m2 — the other cap, carried
-    -- beside this one so the two can be compared without a join back. NULL
-    -- when the column states no coverage maximum.
+    -- *Taux d'implantation au sol max* × piece_area_m2 — the other cap,
+    -- carried beside this one so the two can be compared without a join back.
+    -- NULL when the column states no coverage maximum.
     coverage_cap_m2 double precision,
     -- The lesser of the two, which is the footprint a building may actually
     -- take: the margins say where on the lot, the coverage says how much of

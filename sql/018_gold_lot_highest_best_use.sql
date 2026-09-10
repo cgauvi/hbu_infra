@@ -1,55 +1,105 @@
--- gold.lot_highest_best_use — the highest and best use of every lot in a
--- borough, one row each.
+-- gold.lot_highest_best_use — the highest and best use of every piece of
+-- ground in a borough. One row per (lot, zone).
 --
--- Downstream of silver.lot_development_programs (sql/017) and silver.
--- lot_zoning_envelopes (sql/012), and the answer both exist to produce: every
--- lot a zone reaches, with the program of the *governing* envelope named
--- beside it. Written by hbu_dataplatform's `lot_highest_best_use` asset — see
--- that repo's `urban_rag.hbu.select_highest_best_use`.
+-- Downstream of silver.lot_development_programs (sql/017), silver.
+-- lot_zoning_envelopes (sql/012) and silver.lot_zone_pieces (sql/025), and the
+-- answer they exist to produce: every piece of every lot a zone reaches, with
+-- the program of that zone's *governing* envelope named beside it. Written by
+-- hbu_dataplatform's `lot_highest_best_use` asset — see that repo's
+-- `urban_rag.hbu.select_highest_best_use`.
 --
--- **What "governing" means, and what it is not.** A lot can carry several
--- envelope rows for three reasons, and only one of them is anybody's choice.
+-- ---------------------------------------------------------------------------
+-- Why the key is (lot, zone) and not lot
+-- ---------------------------------------------------------------------------
+--
+-- Because a zoning boundary does not have to follow a lot line, and on a large
+-- parcel it usually does not.
+--
+-- This table used to hold one row per lot. A parcel two zones covered was
+-- treated as one site with two competing readings, and the best-covered zone
+-- won: `pct_of_lot` decided, the other zone's rows were dropped before
+-- anything was solved, and the winner's grid was then priced over the *whole*
+-- parcel. That is right for the case it was written for — a lot on a boundary
+-- picking up a sliver of its neighbour's zoning because two publishers drew
+-- two lines — and wrong for the case it could not tell apart from it.
+--
+-- Lot 1 740 794 in Villeray-Saint-Michel-Parc-Extension: 27 044 m², of which
+-- 24 596 sit in H04-072 (H.7, eight storeys) and 2 440 in C04-083 (C.4 and H,
+-- six). Two sites. They face two different streets — the commercial strip has
+-- the 19.8 m of Jarry and the housing behind it 15.2 m of D'Hérelle — and the
+-- old answer priced eight storeys over all 27 044 m² while never pricing the
+-- C.4 at all. Over that borough it is 1 861 split lots and 121 ha of land
+-- answered under a grid that does not govern it.
+--
+-- So both are solved, each over its own ground, against its own street, under
+-- its own margins, and each keeps its own row. The slivers do not come back
+-- with them: silver.lot_zone_pieces applies the same two cutoffs before
+-- writing a piece at all, so the few square centimetres of residential zone at
+-- the corner of Parc Jarry never reach a solver.
+--
+-- **What that means for reading this table.** `lot_number` groups the pieces
+-- back into a parcel. `is_primary_zone` marks the largest, which is the row a
+-- reader wanting one answer per lot takes and the answer this table used to
+-- give. `num_lot_zones > 1` is the set where one row is not the whole story.
+-- A borough total sums every row; a per-lot join filters `is_primary_zone`, or
+-- aggregates — anything that does neither will multiply the split parcels.
+--
+-- ---------------------------------------------------------------------------
+-- What "governing" means, and what it is not
+-- ---------------------------------------------------------------------------
+--
 -- Within one zone and one usage family, a grid authorises the family in more
 -- than one column and distinguishes them by *Largeur du terrain min* — the
--- column a parcel of this width is written for is `select_governing_column`'s
+-- column a piece of this width is written for is `select_governing_column`'s
 -- pick, carried through as `governs_residential` / `governs_commercial` /
--- `governs_industrial` on sql/012 and sql/017. Across zones, a lot on a
--- boundary picks up a sliver of its neighbour's zoning because two publishers
--- drew two lines — that is a mapping disagreement, not two sets of rules the
--- owner may choose between, and `pct_of_lot` is what says which line is
--- believed.
+-- `governs_industrial` on sql/012 and sql/017.
 --
 -- **Across families the choice is real, and it is priced.** A zone writing an
 -- H.2 column and a C.4 column beside it authorises either building, and which
 -- to put up is exactly the highest-and-best-use question. The chosen row is:
--- among the governing columns of the zone covering most of the lot, the
--- program worth the most discounted net profit (`npv_cad`), column index
--- breaking a tie. The maximisation over the *mix* is still inside
--- `solve_program`; what is maximised here is which governing envelope — the
--- developer's use decision. Picking a non-governing column of the same family
--- would still report a building under rules the parcel may not be built to,
--- and is still never done; every candidate that lost keeps its row in
+-- among the governing columns of this piece's zone, the program worth the most
+-- discounted net profit (`npv_cad`), column index breaking a tie. The
+-- maximisation over the *mix* is still inside `solve_program`; what is
+-- maximised here is which governing envelope — the developer's use decision.
+-- Picking a non-governing column of the same family would still report a
+-- building under rules the parcel may not be built to, and is still never
+-- done; every candidate that lost keeps its row in
 -- silver.lot_development_programs, which is where "why not the other column"
 -- is answered. `hbu_dominant_use` says in one word what kind of building won:
 -- residential, commercial, industrial, mixed, or none.
 --
--- **Every lot the envelopes reach keeps a row.** A lot whose every column
+-- Nothing is maximised *across* pieces any more. Which of a parcel's pieces is
+-- worth more is a question for whoever sorts a shortlist, not one this table
+-- answers by deleting a row.
+--
+-- **Every piece the envelopes reach keeps a row.** A piece whose every column
 -- authorises commerce and not housing has no program at all, and `hbu_status`
 -- says why rather than leaving a null row to be misread as a gap in the data:
 --
 --   solved                a governing envelope was solved
---   no_candidate_column   every envelope on this lot authorises none of the
+--   no_candidate_column   every envelope on this piece authorises none of the
 --                         usages the solver prices — Habitation, Commerce or
 --                         Industrie. Équipements collectifs is deliberately
 --                         not a proforma; pure C and I zones solve like
 --                         everything else now and no longer land here
+--   equipment_zone        the narrower reading of the same absence: this
+--                         piece's grid authorises Équipements collectifs, so
+--                         it is a park or a school rather than a grid that
+--                         failed to parse. Per piece, which is what lets a
+--                         parcel that is half park and half housing say both
 --   no_governing_column   candidate columns exist and none governs — almost
---                         always a lot with no measured frontage under a
+--                         always ground with no measured frontage under a
 --                         grid stating a width minimum, which reads as 0 m
---                         and qualifies for nothing
+--                         and qualifies for nothing. On a split lot an
+--                         interior piece behind a street-facing one genuinely
+--                         fronts nothing, so this is an answer as often as it
+--                         is a gap
 --   infeasible            a governing column was solved and none has a
 --                         feasible program — a minimum the parcel cannot
---                         meet, or stalls it has nowhere to put
+--                         meet. Stalls it has nowhere to put no longer land
+--                         here on their own: such a piece is solved again
+--                         without them, reported solved, and carries
+--                         parking_waived with the stalls it owes beside it
 --   solver_error          a governing column could not be turned into a
 --                         model at all; see the program row's own
 --                         solve_error on sql/017
@@ -78,27 +128,65 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     -- is exactly the parcel gold.lot_redevelopment_gap's is_underbuilt exists
     -- to surface, so it cannot be the row a lot_number key would drop.
     lot_uid      bigint NOT NULL,
+    -- The zone, and the second half of the key. One row per (lot, zone) — one
+    -- per *piece* of ground — because a zoning boundary crossing a large
+    -- parcel makes two sites of it, and both are solved. See the header.
+    feature_id   text NOT NULL,
     lot_number   text,
-    lot_area_m2  double precision,
-    primary_frontage_m double precision,
 
-    -- -- how much of a choice this lot actually had ---------------------
+    -- -- the ground this row is about ---------------------------------------
     --
-    -- Candidates counted, not envelope rows: a lot under a grid with one
+    -- `lot_area_m2` is the parcel; `piece_area_m2` is the ground this zone
+    -- governs and is what the program below was solved over. Equal wherever
+    -- one zone covers a lot whole, which is most of a borough.
+    lot_area_m2   double precision,
+    piece_area_m2 double precision,
+    pct_of_lot    double precision,
+    -- How many pieces the parcel has, where this one ranks by area, and
+    -- whether it is the largest. A reader wanting one row per lot filters
+    -- `is_primary_zone`; a reader summing a borough must not, or the split
+    -- parcels are counted once instead of whole.
+    num_lot_zones   integer,
+    zone_rank       integer,
+    is_primary_zone boolean,
+
+    -- -- what the piece faces, and what stands on it ------------------------
+    --
+    -- The street *this piece* fronts on, re-ranked inside it rather than
+    -- inherited from the lot: on a split parcel a commercial strip and the
+    -- housing behind it face different streets.
+    primary_frontage_m    double precision,
+    primary_street_name   text,
+    secondary_frontage_m  double precision,
+    secondary_street_name text,
+    num_frontages         integer,
+    -- The footprint measured on this piece, and the two shares
+    -- gold.lot_redevelopment_gap divides the lot's assessment by. Both sum to
+    -- 1 across a lot's pieces; see sql/025 for why there are two.
+    existing_footprint_m2 double precision,
+    area_share            double precision,
+    footprint_share       double precision,
+    footprint_share_basis text,
+
+    -- -- how much of a choice this piece actually had ---------------------
+    --
+    -- Candidates counted, not envelope rows: a piece under a grid with one
     -- Habitation column and three Commerce ones had one choice, and
     -- num_candidates says 1, not 4.
     num_candidates            integer NOT NULL DEFAULT 0,
     num_governing_candidates  integer NOT NULL DEFAULT 0,
+    -- The zones of the *lot*, so the same number on each of its pieces — the
+    -- reader's cue that this row is one of several. Duplicates num_lot_zones
+    -- above and predates it; both are kept because the older readers filter on
+    -- this one.
     num_zones                 integer NOT NULL DEFAULT 0,
     -- One of the five values the header lists.
     hbu_status  text NOT NULL,
 
     -- -- the governing envelope, when there is one -----------------------
-    feature_id    text,
     source_table  text,
     column_index  integer,
     grid_zone     text,
-    pct_of_lot    double precision,
     usages        jsonb,
     permits_commercial boolean,
     permits_industrial boolean,
@@ -129,10 +217,8 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     residential_floors           integer,
     commercial_floors            integer,
     industrial_floors            integer,
-    above_grade_parking_floors   integer,
     underground_levels           integer,
     underground_stalls           integer,
-    above_grade_stalls           integer,
     -- On the yard rather than in the building. See sql/017.
     surface_stalls               integer,
     -- In the ground floor rather than on a storey of its own. See sql/017.
@@ -150,7 +236,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     program_assumptions jsonb NOT NULL DEFAULT '{}'::jsonb,
 
     loaded_at    timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid)
+    -- The zone is in the key. One row per piece of ground, not per parcel:
+    -- see the header, and gold.lot_redevelopment_gap and the three tables
+    -- below it, which all follow this key for the same reason.
+    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
 ) PARTITION BY LIST (neighborhood);
 
 -- "How many lots are answered, and how many of each unanswered kind" — the
@@ -158,6 +247,14 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
 -- scan the whole borough for it.
 CREATE INDEX IF NOT EXISTS lot_highest_best_use_status_idx
     ON gold.lot_highest_best_use (hbu_status);
+-- The two indexes over `is_primary_zone` and `num_lot_zones` are created in
+-- sql/025 rather than here, and the reason is the order these files run in.
+-- `CREATE TABLE IF NOT EXISTS` above does nothing on a database that already
+-- holds this table, so on such a database those columns do not exist until
+-- 025's migration adds them — and an index over a column that is not there
+-- yet fails the file, and with it the rest of the init. 025 adds the columns
+-- and the indexes together, which works on a fresh database and on an
+-- existing one alike. See "Re-keying the tables downstream" there.
 -- "The most valuable redevelopments in the borough" — the read this table is
 -- for once a lot is answered. Partial, the way silver.
 -- lot_assessment_comparables' cap_rate_pct index is: an unanswered lot's NOI
@@ -236,6 +333,18 @@ ALTER TABLE gold.lot_highest_best_use
     ADD COLUMN IF NOT EXISTS surface_area_m2 double precision,
     ADD COLUMN IF NOT EXISTS parkable_area_m2 double precision;
 
+-- placeable_area_m2 is the counterpart of buildable_area_m2 above and belongs
+-- to the chosen *envelope* rather than to the parcel, so it sits beside it and
+-- is null on the rows with no program: the largest rectangle that fits inside
+-- that column's margins, which is the third cap on footprint_m2 and the ground
+-- surface_area_m2 is rationed against (lot_area_m2 less this, charged whole).
+-- See sql/017 for why an area cap alone was not enough, and lot 6 744 583 for
+-- what it cost. Read beside buildable_area_m2 it is the answer to "why is this
+-- plate so much smaller than the envelope": the margins leave the area and the
+-- envelope's shape does not hold a building of it.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS placeable_area_m2 double precision;
+
 -- The sous-sol, added when the solver stopped treating everything below grade
 -- as parking. Article 38 1 of by-law 01-283 excludes *une aire de
 -- stationnement des vehicules [...] situee en sous-sol, de meme que leurs
@@ -271,6 +380,19 @@ ALTER TABLE gold.lot_highest_best_use
 -- beside it, not a norm the grid prints. binding names 'basement_levels' where
 -- the cellar is spent and 'basement_unbuilt' where the level rows allow one
 -- and the arithmetic declined to build it.
+--
+-- **Which rows authorise one is not the same question for the three
+-- families.** A dwelling goes below grade only where the grid names the level
+-- - the *Inferieurs au RDC* row, marked on 91 of Villeray's 1 555 columns.
+-- Commerce and industry go there under that row or under *Tous les niveaux*,
+-- on the reading that a column confining a shop to no floor in particular has
+-- not excluded the floor beneath it: a stock room under a store is the same
+-- usage as the store, and somebody's home is not. So
+-- basement_commercial_area_m2 and basement_industrial_area_m2 turn up across
+-- the borough and basement_residential_area_m2 only where the grid spelled the
+-- cellar out - and, at the rates in program_assumptions, hardly even there:
+-- the premium and the discount together put a sous-sol dwelling just under
+-- water at every class CMHC prices.
 ALTER TABLE gold.lot_highest_best_use
     ADD COLUMN IF NOT EXISTS density_floor_area_m2 double precision,
     ADD COLUMN IF NOT EXISTS basement_area_m2 double precision,
@@ -306,3 +428,82 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the gross income split by the family that earns it
+-- ---------------------------------------------------------------------------
+--
+-- The chosen program's side of sql/017's widening of the same name, which is
+-- where the argument is written out in full. In short: a building's income is
+-- not divided the way its floor is, because commerce earns several times what
+-- housing does per square foot, and the cellar plates are rented at a discount
+-- and stand outside commercial_area_m2 — so the split has to be carried.
+--
+-- The three sum to annual_gross_revenue_cad less the parking rent beside them
+-- (annual_parking_gross_revenue_cad). gold.lot_redevelopment_gap nets
+-- them into hbu_residential_noi_cad and its two neighbours, and
+-- hbu_dataplatform's `urban_rag.proforma` blends a cap rate over those.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS annual_residential_gross_revenue_cad double precision,
+    ADD COLUMN IF NOT EXISTS annual_commercial_gross_revenue_cad  double precision,
+    ADD COLUMN IF NOT EXISTS annual_industrial_gross_revenue_cad  double precision;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the parking waived
+-- ---------------------------------------------------------------------------
+--
+-- The chosen program's side of sql/017's widening of the same name, which is
+-- where the argument is written out. In short: a piece whose stalls alone made
+-- every governing program infeasible used to report hbu_status = 'infeasible'
+-- and nothing else; it now reports 'solved' with the program the envelope
+-- holds, parking_waived = true, and waived_stalls saying how many stalls that
+-- program owes at program_assumptions' ratios and does not provide. Every
+-- stall column on such a row is 0 because nothing was provided, not because
+-- nothing was owed - which is the whole reason the flag travels with them.
+--
+-- Nullable here and NOT NULL there for the reason every carried program column
+-- is: a piece with no program at all waived nothing, and false would read as
+-- "solved with its parking" where the honest value is "nothing was chosen".
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS parking_waived boolean,
+    ADD COLUMN IF NOT EXISTS waived_stalls  integer;
+
+-- "Every chosen programme standing on a parking variance" - what the Deal pane
+-- warns about per lot, counted over a borough.
+CREATE INDEX IF NOT EXISTS lot_highest_best_use_parking_waived_idx
+    ON gold.lot_highest_best_use (lot_uid)
+    WHERE parking_waived;
+
+-- ---------------------------------------------------------------------------
+-- Widening: what the parking earns
+-- ---------------------------------------------------------------------------
+--
+-- The chosen program's side of sql/017's widening of the same name, which
+-- states the rule. The stalls somebody rents and their rent a year (inside
+-- annual_gross_revenue_cad, so the three family lines sum to the gross less
+-- it), the coverage in stalls per dwelling, the lease-up months that coverage
+-- saves the housing, and the present value of the saving (inside
+-- present_value_cad and npv_cad, in no NOI). Nullable here, like every carried
+-- program column: a piece with no program rents nothing, and 0 would read as
+-- "nothing rented" where the honest value is "nothing was chosen".
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS rented_stalls                    integer,
+    ADD COLUMN IF NOT EXISTS annual_parking_gross_revenue_cad double precision,
+    ADD COLUMN IF NOT EXISTS parking_coverage                 double precision,
+    ADD COLUMN IF NOT EXISTS lease_up_months_saved            double precision,
+    ADD COLUMN IF NOT EXISTS absorption_value_cad             double precision;
+
+-- ---------------------------------------------------------------------------
+-- Widening: three provisions, and the hole is the parcel's
+-- ---------------------------------------------------------------------------
+--
+-- The chosen program's side of sql/017's widening of the same name, which
+-- states the rule: the above-grade deck is no longer a provision and its two
+-- columns are dropped, and the dug parking sits on a plate of its own -
+-- underground_plate_m2, bounded by the parcel rather than by footprint_m2 -
+-- so underground_area_m2 is the stalls' own area and no longer the footprint
+-- times the levels. Nullable here, like every carried program column.
+ALTER TABLE gold.lot_highest_best_use
+    ADD COLUMN IF NOT EXISTS underground_plate_m2 double precision,
+    DROP COLUMN IF EXISTS above_grade_parking_floors,
+    DROP COLUMN IF EXISTS above_grade_stalls;

@@ -69,16 +69,31 @@
 -- the parcels worth opening a map on.
 --
 -- ---------------------------------------------------------------------------
--- Up to three patches, and why more than one
+-- A band around the building, not a rectangle
 -- ---------------------------------------------------------------------------
 --
--- Unlike the building, which is one massing or nothing, `geom` can be a
--- MultiPolygon. Parking honestly comes in pieces: a building across the middle
--- of its parcel leaves a front yard and a rear yard, and stalls in both is the
--- ordinary Montreal answer rather than a compromise. Insisting on a single
--- rectangle would report such a lot at half its real capacity and make the fit
--- column cry wolf on the common case. `num_parking_bays` says how many were
--- used, and parking_width_m/parking_depth_m describe the largest of them.
+-- `geom` is the shape of the yard it was cut from — a ring around a plate in
+-- the middle of its parcel, an L, a wedge behind a corner building. It is
+-- drawn in two steps: the yard is opened by half a stall's depth to settle
+-- what may be paved at all, and then a band is grown out from the building
+-- until it holds the program's surface_area_m2. So the paving is contiguous
+-- and it hugs the plate, which is what a real lot does and what makes the
+-- polygon a site plan rather than a shading.
+--
+-- It used to be up to three rectangles pieced together, and that was the wrong
+-- primitive: no rectangle covers a ring, so a yard wrapping a building was
+-- reported at a little over half its area. Across 600 real VSMPE yards the
+-- bays kept a median 34 pct of the ground and the opening keeps 79.
+--
+-- `geom` can still be a MultiPolygon and `num_parking_bays` still says how
+-- many pieces — a band reaches a second lobe of an odd parcel only once the
+-- first is full — but 1 is now the common answer rather than the exception.
+--
+-- **parking_width_m and parking_rotation_deg are NULL from this change on.**
+-- They were the largest rectangle's short side and its bearing; a band has
+-- neither, and writing 0 would read as a measurement rather than as the
+-- absence of one. parking_depth_m survives with a new meaning: how far out
+-- from the building the paving reaches.
 --
 -- ---------------------------------------------------------------------------
 -- Only the lots that park on the ground are here
@@ -106,9 +121,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_surface_parking (
     -- parking join on one column.
     lot_uid      bigint NOT NULL,
     lot_number   text,
-    -- The governing (zone, column) the program was solved under, carried for
+    -- The zone whose piece of ground this yard is on, and the column it was
+    -- solved under. In the key, like sql/022. Carried for
     -- the same tracing sql/022 carries it for.
-    feature_id   text,
+    feature_id   text NOT NULL,
     column_index integer,
     hbu_status   text,
     -- The building's status, restated, because the yard is what that building
@@ -136,16 +152,21 @@ CREATE TABLE IF NOT EXISTS gold.lot_surface_parking (
     -- 100 × placed / reserved. The column this table is for; see the header.
     surface_parking_fit_pct   double precision,
 
-    -- -- the rectangle itself ----------------------------------------------
+    -- -- the band itself ----------------------------------------------------
     --
-    -- The largest bay's two sides in metres and the bearing of its long axis.
-    -- parking_depth_m is the dimension the by-law states and the search holds
-    -- at or above 5.5 m; parking_width_m is what the area then asks for.
+    -- parking_depth_m is how far the paving reaches out from the building —
+    -- the one dimension a band has, and at least the 5.5 m the by-law states
+    -- because nothing shallower survives the opening.
+    --
+    -- parking_width_m and parking_rotation_deg are NULL since the rectangle
+    -- search was replaced; kept for the shape of the table and for the rows
+    -- written before it. See the header.
     parking_width_m    double precision,
     parking_depth_m    double precision,
     parking_rotation_deg double precision,
-    -- How many separate patches the asphalt took. 1 is a single lot; more is a
-    -- front yard and a rear one, which is ordinary rather than a compromise.
+    -- How many separate pieces the asphalt took. 1 is the common answer; more
+    -- means the band reached a second lobe of an odd parcel after filling the
+    -- first, which is ordinary rather than a compromise.
     num_parking_bays   integer,
 
     -- -- the ground it was found in, for scale ------------------------------
@@ -166,7 +187,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_surface_parking (
     -- MultiPolygon wherever the parking took more than one bay.
     geom      geometry(Geometry, 4326),
     loaded_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid)
+    -- The zone is in the key: one row per piece of ground, following
+    -- gold.lot_highest_best_use. See sql/018's header for why a parcel is
+    -- not always one site.
+    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
 ) PARTITION BY LIST (neighborhood);
 
 -- The map read: "every surface parking lot in this bounding box". The reason

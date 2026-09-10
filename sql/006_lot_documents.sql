@@ -107,16 +107,27 @@ CREATE VIEW rag.lot_documents AS
 -- this one takes the lot number - which is what a user actually has - and
 -- reads the join back out of silver.lot_features instead of recomputing it.
 --
--- Two cutoffs, and the defaults differ because they are different in kind.
+-- Two cutoffs, and both are on by default, because they measure the same
+-- artefact in two measures and neither catches what the other does.
 --
--- `min_pct_of_lot` is the judgement, defaulted to 0 so the answer includes
--- everything unless the caller says otherwise. 1.0 is a reasonable value once
--- the misalignment between cadastre and zoning is the thing being filtered.
---
--- `min_overlap_m2` is the artefact filter, and defaults to 1 because there is
--- no threshold a caller could sensibly read it back at: under a square metre
+-- `min_overlap_m2` is the absolute one and defaults to 1: under a square metre
 -- the two publishers' lines have simply missed each other, and the grid that
--- comes back is the block next door's. Pass 0 to get the old behaviour.
+-- comes back is the block next door's. It is what catches the few square
+-- centimetres of a residential zone at the corner of Parc Jarry, which as a
+-- percentage of 1.59 square kilometres is far too small a number to threshold
+-- on.
+--
+-- `min_pct_of_lot` is the proportional one and now defaults to 1 as well. A
+-- square metre is not a large number on a lot line: 1.19 m2 of C03-130 on lot
+-- 6 291 714 - 438 m2, otherwise entirely in H03-126 - clears the absolute
+-- cutoff and is still a survey disagreement, and used to bring the commercial
+-- block's grid back beside the residential one that actually governs the
+-- parcel. One per cent is a judgement rather than a property of the data, and
+-- it was made against Villeray-Saint-Michel-Parc-Extension, where it removes
+-- 930 of 28 850 lot x zone pairs and every one of them is a boundary artefact.
+--
+-- Pass 0 to either to get the old behaviour; `silver.lot_features` is
+-- thresholded at neither, so nothing has been lost upstream.
 -- ---------------------------------------------------------------------------
 
 -- The signature gains an argument, so the old one has to go explicitly:
@@ -131,7 +142,7 @@ CREATE OR REPLACE FUNCTION rag.search_at_lot_number (
     query_embedding vector,
     in_lot_number   text,
     match_count     integer DEFAULT 5,
-    min_pct_of_lot  double precision DEFAULT 0,
+    min_pct_of_lot  double precision DEFAULT 1,
     min_overlap_m2  double precision DEFAULT 1,
     on_source_table text DEFAULT NULL
 )

@@ -1,12 +1,15 @@
--- gold.lot_building_massing — the highest-and-best-use building of every lot,
--- as a rectangle standing on the ground it would be built on.
+-- gold.lot_building_massing — the highest-and-best-use building of every piece
+-- of ground, as a rectangle standing on the ground it would be built on. One
+-- row per (lot, zone).
 --
 -- Downstream of gold.lot_highest_best_use (sql/018) for the footprint and
 -- silver.lot_buildable_setbacks (sql/015) for the envelope it has to fit
 -- inside. The one table in this platform whose output is meant to be *looked
--- at* rather than queried: one polygon per lot, in EPSG:4326, that can be
+-- at* rather than queried: one polygon per site, in EPSG:4326, that can be
 -- dropped onto a map beside the cadastre to see whether the answer upstream is
--- plausible. Written by hbu_dataplatform's `lot_building_massing` asset — see
+-- plausible. A parcel two zones cut in two gets two rectangles, each inside
+-- its own grid's margins and on the ground that grid governs, and the two do
+-- not overlap. Written by hbu_dataplatform's `lot_building_massing` asset — see
 -- that repo's `urban_rag.massing`.
 --
 -- **The rectangle respects the margins by construction.** It is fitted inside
@@ -99,10 +102,12 @@ CREATE TABLE IF NOT EXISTS gold.lot_building_massing (
     -- has an envelope and a building.
     lot_uid      bigint NOT NULL,
     lot_number   text,
-    -- The governing (zone, column) the footprint was solved under, carried so
+    -- The zone whose piece of ground this rectangle stands on, and the column
+    -- it was solved under. In the key since the move to the piece grain: a lot
+    -- two zones cut in two gets two buildings, one on each piece. Carried so
     -- the rectangle can be traced back to the envelope it was fitted into —
     -- silver.lot_buildable_setbacks is keyed on exactly this triple.
-    feature_id   text,
+    feature_id   text NOT NULL,
     column_index integer,
     -- gold.lot_highest_best_use.hbu_status, restated. On this table it is
     -- always 'solved': a lot without a program has no rectangle and so no row.
@@ -142,7 +147,6 @@ CREATE TABLE IF NOT EXISTS gold.lot_building_massing (
     residential_floors        integer,
     commercial_floors         integer,
     industrial_floors         integer,
-    above_grade_parking_floors integer,
     underground_levels        integer,
     num_dwellings             integer,
     -- What was costed, and what the drawn footprint would actually carry at
@@ -161,7 +165,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_building_massing (
     -- happens to produce on a degenerate parcel.
     geom      geometry(Geometry, 4326),
     loaded_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid)
+    -- The zone is in the key: one row per piece of ground, following
+    -- gold.lot_highest_best_use. See sql/018's header for why a parcel is
+    -- not always one site.
+    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
 ) PARTITION BY LIST (neighborhood);
 
 -- The parking, summarised. The polygon itself is in gold.lot_surface_parking
@@ -222,3 +229,9 @@ BEGIN
     END IF;
 END
 $$;
+
+-- The above-grade parking deck left the solver (sql/017, "three provisions"),
+-- so the storey count it carried here goes with it: floors is the three usage
+-- kinds, and nothing a massing extrudes is a deck.
+ALTER TABLE gold.lot_building_massing
+    DROP COLUMN IF EXISTS above_grade_parking_floors;
