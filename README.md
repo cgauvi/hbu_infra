@@ -1039,6 +1039,83 @@ defaults to medium for that reason.
 
 ---
 
+## Tearing it down
+
+Three targets, in this order, each one wider than the last:
+
+```bash
+make destroy      ENV=dev   # one environment
+make destroy-all            # every environment, then the shared stack
+make destroy-bootstrap      # ...and the state backend that held all of it
+```
+
+The order is not a style preference. Each per-env stack reads the shared one
+through `data.terraform_remote_state`, so a shared stack destroyed first leaves
+every env stack *unplannable* — `make destroy ENV=dev` then fails on the lookup
+rather than on anything it is trying to delete, and the only way forward is to
+apply the shared stack back first. `destroy-all` walks the order that works,
+over every environment with a `.tfvars` file, so a new env is torn down by
+existing rather than by being remembered.
+
+Each target prints what it is about to remove and then waits for its own name
+to be typed back. `CONFIRM=destroy-all` is the same answer given up front, for
+a script; `AUTO_APPROVE=1` additionally drops terraform's own prompt at every
+stack. Neither is the default, and `destroy-all` refuses outright when there is
+no terminal to ask at and no `CONFIRM=`.
+
+### What stops a destroy
+
+Two things, both checked up front rather than ten minutes in, after the cheap
+half of the stack is already gone:
+
+**Deletion protection.** `prod.tfvars` sets `db_deletion_protection` and
+`app_deletion_protection`. Both are attributes on the *live* instance and load
+balancer, and a destroy deletes rather than modifies — so passing
+`-var=db_deletion_protection=false` on the destroy changes nothing at all. AWS
+still refuses, and by then the subnets, the secrets and the service are gone.
+It has to come off in an apply first:
+
+```bash
+make destroy ENV=prod UNPROTECT=1   # targeted apply to unprotect, then destroy
+```
+
+**A stopped instance.** `make db-stop` leaves it in `stopped`, and RDS will not
+delete from there; on prod, which takes a final snapshot, it could not take one
+anyway. Start it first:
+
+```bash
+make db-start db-wait ENV=prod
+```
+
+### The state backend is separate on purpose
+
+`destroy-all` deliberately leaves three things standing: the state bucket, the
+lock table, and the `hbu-github-deploy` role. `make destroy-bootstrap` takes
+those, and it is the one step with no way back — it deletes the record of what
+exists, so anything still standing afterwards can only be found by hand, in the
+console, one service at a time. It refuses to run while any state file still
+holds resources.
+
+It does three things `terraform destroy` will not do by itself: it empties the
+bucket version by version (it is versioned, so `aws s3 rm --recursive` leaves
+old versions and delete markers behind, and both keep `DeleteBucket` answering
+`BucketNotEmpty`); it drops the bucket and its sub-resources out of state,
+because `prevent_destroy` takes a literal rather than a variable and no flag
+can turn it off; and it deletes the bucket afterwards, then checks that it is
+actually gone rather than trusting the exit code.
+
+That last part matters because **bootstrap is the one stack whose state is
+local**, and `bootstrap/terraform.tfstate` is gitignored. Run this anywhere but
+the machine that ran `make bootstrap` and it finds an empty state, destroys
+nothing, and would otherwise report success.
+
+One thing survives all of it: the GitHub OIDC *provider*
+(`token.actions.githubusercontent.com`). It is a data source here, not a
+resource — it was created by another project in this account, and an account may
+only register a given provider URL once. Deleting it would break that project.
+
+---
+
 ## Files
 
 | File | What it holds |

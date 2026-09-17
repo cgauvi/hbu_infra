@@ -1,21 +1,37 @@
--- silver.neighborhood_streets — sides of the roadway, from Montreal's géobase
--- double, cut to one borough.
+-- silver.neighborhood_streets — the roadway centre lines, from the RQTT, cut
+-- to one borough.
 --
--- Not the plain géobase, which draws one centre line per segment. A lot faces
--- one *side* of a street, and the side is where the curb and sidewalk limits
--- are, so the double is the layer a frontage question can be asked against —
--- see 008_silver_lot_frontage.sql, which is the only reader of this table
--- today.
+-- The RQTT (Référentiel québécois du transport terrestre) is the MRNF's
+-- province-wide road network, and it replaced three municipal layers at once:
+-- Montreal's géobase double, Quebec City's vque_18 and Saguenay's
+-- sag-reseau-routier. One publication, one schema, so a new city needs a
+-- bounding box rather than a new branch.
+--
+-- It draws one centre line per segment where the géobase double drew two
+-- sides, one along each curb. That matters less than it sounds: the frontage
+-- measure in 008_silver_lot_frontage.sql is the boundary a lot *shares* with a
+-- road parcel and needs no line at all. What the line does is identify which
+-- parcels are roadway and name the street, and a centre line does both — it
+-- runs down the axis of the road parcel rather than hugging its edge. Where it
+-- does cost something is the fallback reach, which is measured from the line;
+-- see postgis.DEFAULT_FRONTAGE_FALLBACK_BUFFERS_M.
 --
 -- Filled by hbu_dataplatform's `neighborhood_streets` asset from its own
--- silver/neighborhood_streets partitions: the city publishes the layer
--- island-wide, and the pipeline cuts it to a borough before loading, so the
--- rows here are already clipped to the (neighborhood, scrape_date) they carry.
+-- silver/neighborhood_streets partitions: the MRNF publishes the layer for the
+-- province, and the pipeline cuts it to a borough before loading, so the rows
+-- here are already clipped to the (neighborhood, scrape_date) they carry.
 --
--- `cote_rue_id` is the publisher's own key for a street side and is unique
--- across the island (91,546 of 91,546 in the first snapshot), which makes it
--- the natural key this table's upsert conflicts on — one street side, one
--- borough, one day, one row.
+-- `cote_rue_id` is the publisher's own key for a segment — the RQTT's
+-- `AQRP_UUID`, which is one per segment across the province, and not `IdRte`,
+-- which carries both nulls and duplicates. That uniqueness makes it the
+-- natural key this table's upsert conflicts on — one segment, one borough, one
+-- day, one row.
+--
+-- The *name* `cote_rue_id` is a côté de rue, a side of street, and nothing
+-- here is one any more. It is kept deliberately: it is in this primary key and
+-- silver.lot_frontage's, denormalised into gold.lot_profiles, and read by the
+-- map's tile queries, and re-keying all of that to win a better word would
+-- risk the lineage to fix a noun.
 --
 -- `length_m` rather than `area_m2`: these are lines. `street_name` gets a
 -- column of its own rather than a slot in `attributes` because it is what a
@@ -31,7 +47,7 @@
 -- move. A partitioned table's primary key must contain its partition keys, so
 -- a bigserial could not be one; and nothing needed it to be, because the key
 -- that means anything here was always `cote_rue_id` - the publisher's own,
--- unique across the island, and already what silver.lot_frontage denormalised
+-- unique across the province, and already what silver.lot_frontage denormalised
 -- rather than the serial. The old table is left in place; drop it once nothing
 -- reads it:
 --
@@ -42,9 +58,10 @@ SET search_path TO silver, public;
 CREATE TABLE IF NOT EXISTS silver.neighborhood_streets (
     scrape_date  date NOT NULL,
     neighborhood text NOT NULL,
-    -- COTE_RUE_ID in the published layer.
+    -- The publisher's AQRP_UUID, under this platform's COTE_RUE_ID.
     cote_rue_id  text NOT NULL,
-    -- NOM_VOIE. Nullable: an unnamed service lane is a real street side.
+    -- NomRte, under this platform's NOM_VOIE. Nullable: 231 of the Montreal
+    -- box's 93,521 segments are unnamed, and a service lane is a real road.
     street_name  text,
     length_m     double precision,
     attributes   jsonb NOT NULL DEFAULT '{}'::jsonb,

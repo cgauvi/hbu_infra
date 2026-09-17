@@ -97,6 +97,19 @@ CREATE TABLE IF NOT EXISTS silver.zoning_grid_columns (
     secondary_front_margin_max_m double precision,
     side_margin_min_m            double precision,
     rear_margin_min_m            double precision,
+    -- The margin a *rear* lot line takes where that line faces a street, for
+    -- a by-law that states one apart from the side-on-street margin. Saguenay
+    -- is the only publisher here that does - its grid prints *Arrière sur
+    -- rue* beside *Latérale sur rue* - so this is NULL on every Montreal and
+    -- Quebec City row, where `secondary_front_margin_min_m` governs every
+    -- street edge after the first.
+    --
+    -- Two columns rather than one because which of them applies is a fact
+    -- about the *lot* and not about the zone: the second street edge of a
+    -- corner lot is a side line and of a through lot is its rear line, and a
+    -- zone contains both kinds. The choice is made per lot in sql/015 - see
+    -- `secondary_setback_rule` there.
+    rear_on_street_margin_min_m  double precision,
     -- Free text as the grid prints it ("3", "1, 4"): a reference into the
     -- borough's own usage numbering, not a list this platform can resolve.
     only_permitted_usages        text,
@@ -248,6 +261,8 @@ CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     secondary_front_margin_max_m double precision,
     side_margin_min_m            double precision,
     rear_margin_min_m            double precision,
+    -- Saguenay's only; see the note on the same column above.
+    rear_on_street_margin_min_m  double precision,
     only_permitted_usages        text,
     excluded_usages              text,
 
@@ -293,6 +308,21 @@ ALTER TABLE silver.lot_zoning_envelopes
     ADD COLUMN IF NOT EXISTS permits_industrial boolean,
     ADD COLUMN IF NOT EXISTS governs_commercial boolean,
     ADD COLUMN IF NOT EXISTS governs_industrial boolean;
+
+-- The other on-street margin, which Saguenay's grid states and Montreal's and
+-- Quebec City's do not - see the note on the column in the CREATE above. It is
+-- repeated here for the reason the block above gives and one more: CREATE
+-- TABLE IF NOT EXISTS leaves an existing table exactly as it found it, so a
+-- column added to the body of one reaches a fresh database only. On every
+-- database that predates it the column is missing, and the failure surfaces
+-- one table downstream - urban_rag.warehouse stages every load in a temp table
+-- built `LIKE` its target, so the missing column comes back as
+-- `column ... of relation silver_..._load does not exist`.
+ALTER TABLE silver.zoning_grid_columns
+    ADD COLUMN IF NOT EXISTS rear_on_street_margin_min_m double precision;
+
+ALTER TABLE silver.lot_zoning_envelopes
+    ADD COLUMN IF NOT EXISTS rear_on_street_margin_min_m double precision;
 
 DO $$
 DECLARE

@@ -142,6 +142,36 @@
 -- only the one: a corner lot's second street edge is still a street edge, and
 -- treating it as unregulated would give a corner parcel more buildable area
 -- than the mid-block lot beside it.
+--
+-- ---------------------------------------------------------------------------
+-- Two on-street margins, and why the lot picks between them
+-- ---------------------------------------------------------------------------
+--
+-- Saguenay's grid states *four* margins for a lot line that is not the front:
+-- *Latérale 1*, *Latérale 2*, *Latérale sur rue* and *Arrière sur rue*. The
+-- last two are the same lot lines as the first two and the rear, priced
+-- differently because they face a street. Montreal states one *Avant
+-- secondaire* for all of it and Quebec City states none.
+--
+-- The secondary class here is one thing - `frontage_rank = 2` - and it is two
+-- different lot lines depending on the parcel. On a corner lot the second
+-- street edge runs into the front edge and is a *side* line; on a through lot
+-- it runs parallel to the front and is the *rear* line. A zone has both kinds
+-- of parcel in it, so the by-law's two figures cannot be collapsed into one
+-- when the grid is read, and both travel on the envelope row (sql/012).
+--
+-- The choice is made here, per lot, with the test this file already runs to
+-- tell a rear line from a side one: the rank-2 edge is segmentized and each
+-- piece compared to the front edge, and the edge is *rear on street* when
+-- more of its length runs parallel to the front than does not. So:
+--
+--   secondary edge mostly parallel to the front  ->  *Arrière sur rue*
+--   otherwise                                    ->  *Latérale sur rue*
+--
+-- `secondary_setback_rule` records which was read, exactly as
+-- `side_setback_rule` records the mode reading, and it is 'secondary_front'
+-- on every Montreal and Quebec City row because those grids state only one
+-- on-street margin and there is nothing to choose between.
 
 SET search_path TO silver, public;
 
@@ -194,6 +224,13 @@ CREATE TABLE IF NOT EXISTS silver.lot_buildable_setbacks (
     -- What the grid printed for *Latérale min*, before the mode rule. NULL
     -- when it printed nothing.
     side_margin_min_m double precision,
+    -- Which of the grid's on-street margins `secondary_front_setback_m` was
+    -- taken from: 'rear_on_street' where the rank-2 street edge was measured
+    -- as running parallel to the front and the grid states an *Arrière sur
+    -- rue*, and 'secondary_front' otherwise - which is every row of a borough
+    -- whose grid states one on-street margin, and every lot with no rank-2
+    -- edge at all. See the header.
+    secondary_setback_rule text,
 
     -- The four distances actually differenced out of the parcel, in metres.
     -- Every one is >= 0: an unstated margin is 0 here and NULL upstream.
@@ -279,6 +316,22 @@ CREATE INDEX IF NOT EXISTS lot_buildable_setbacks_governing_idx
 -- whole table exists to make answerable, and a filter on one column.
 CREATE INDEX IF NOT EXISTS lot_buildable_setbacks_binding_idx
     ON silver.lot_buildable_setbacks (footprint_cap_binding);
+
+-- Which of the grid's two on-street margins the rank-2 edge was measured to
+-- take - see the header. ADD COLUMN IF NOT EXISTS for the reason sql/009 and
+-- sql/012 use it: the CREATE TABLE IF NOT EXISTS above leaves an existing
+-- table exactly as it found it, so a column added to its body reaches a fresh
+-- database only, and on an older one the load fails a step later - the staging
+-- table urban_rag.warehouse builds `LIKE` this target comes back a column
+-- short, as `column "secondary_setback_rule" of relation
+-- "silver_lot_buildable_setbacks_load" does not exist`.
+--
+-- Applied to the partitioned parent, which carries it down to every
+-- neighborhood partition already attached. Rows written before this lands keep
+-- a NULL here rather than a wrong reading; `make setbacks` fills it on the
+-- next run of the partition.
+ALTER TABLE silver.lot_buildable_setbacks
+    ADD COLUMN IF NOT EXISTS secondary_setback_rule text;
 
 DO $$
 DECLARE

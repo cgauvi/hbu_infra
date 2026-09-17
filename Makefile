@@ -24,6 +24,10 @@
 #   make plan        ENV=dev
 #   make app-push app-deploy ENV=dev  # ship a code change
 #   make app-logs    ENV=dev        # tail the container
+#
+#   # taking it all down again, in this order:
+#   make destroy-all                # every env stack, then the shared one
+#   make destroy-bootstrap          # ...and the state backend that held them
 
 ENV        ?= dev
 AWS_REGION ?= us-east-1
@@ -146,6 +150,20 @@ CURRENT_IP = $(shell curl -sS --max-time 10 https://checkip.amazonaws.com 2>/dev
 
 TF_VARS = -var-file="$(ENV).tfvars" -var="current_ip=$(CURRENT_IP)"
 
+# terraform's own "Enter a value:" prompt is the last thing standing between a
+# typo and a deleted database, so it stays on by default. AUTO_APPROVE=1 turns
+# it off for the whole run — including every stack `destroy-all` recurses into,
+# since a variable set on the command line reaches sub-makes through MAKEFLAGS.
+TF_APPROVE = $(if $(AUTO_APPROVE),-auto-approve)
+
+# Every environment that has a tfvars file, so adding one is enough to have it
+# torn down too. A hand-kept list here would go stale exactly once — on the env
+# nobody remembered — and the first sign of that is an AWS bill for a stack no
+# command can see any more. An env that was never applied costs one no-op
+# destroy against an empty state, which is the cheaper failure by a distance.
+# *.auto.tfvars is a local overlay on an env, not an env; keep it out.
+ENVS ?= $(filter-out %.auto,$(patsubst %.tfvars,%,$(wildcard *.tfvars)))
+
 # With no public endpoint there is no route from a laptop to the instance, so
 # every db-* target can be pointed at an open `make db-tunnel` session instead:
 #
@@ -201,18 +219,19 @@ DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tu
 
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
+        destroy-all destroy-bootstrap \
         db-deps uv-check db-init db-check db-shell db-url db-secret db-env \
         db-query db-wait db-start db-stop db-tunnel \
         app-login app-build app-push app-deploy app-status app-wait app-logs \
         app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token
 
 help:
-	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 # Order-only so a failure stops the run before anything touches AWS, and so the
 # check runs once per invocation no matter how many of these are named.
 bootstrap init-shared plan-shared apply-shared destroy-shared \
-init plan apply destroy validate output: | aws-check
+init plan apply destroy validate output destroy-all destroy-bootstrap: | aws-check
 db-init db-bootstrap db-ca db-check db-shell db-url db-secret db-env db-app-env \
 db-query db-wait db-start db-stop db-tunnel: | aws-check
 app-login app-build app-push app-deploy app-status app-wait app-logs \
@@ -270,9 +289,9 @@ apply-shared: ## Apply the shared VPC stack (run plan-shared first)
 	$(TF_SHARED) apply tfplan && rm -f shared/tfplan
 
 # Only safe once every per-env stack is gone: their remote_state lookups fail
-# without the shared outputs.
+# without the shared outputs. `make destroy-all` walks them in that order.
 destroy-shared: init-shared ## Destroy the shared VPC stack
-	$(TF_SHARED) destroy
+	$(TF_SHARED) destroy $(TF_APPROVE)
 
 init: ## terraform init for ENV
 	$(TF) init -reconfigure $(TF_BACKEND)
@@ -284,7 +303,8 @@ apply: ## Apply ENV (run plan first)
 	$(TF) apply tfplan && rm -f tfplan
 
 destroy: init ## Destroy ENV
-	$(TF) destroy $(TF_VARS)
+	@$(call preflight_destroy,$(ENV))
+	$(TF) destroy $(TF_VARS) $(TF_APPROVE)
 
 fmt: ## Rewrite all .tf files to canonical format
 	$(TF) fmt -recursive .
@@ -294,6 +314,170 @@ validate: init ## Validate the per-env configuration
 
 output: ## Show ENV outputs
 	$(TF) output
+
+# ---------------------------------------------------------------------------
+# Teardown
+#
+#   make destroy      ENV=dev   # one environment
+#   make destroy-all            # every environment, then the shared stack
+#   make destroy-bootstrap      # ...and the state backend that held all of it
+#
+# The order is the whole point. A per-env stack reads the shared one through
+# data.terraform_remote_state, so a shared stack destroyed first leaves every
+# env stack unplannable: `make destroy ENV=dev` then fails on the lookup rather
+# than on anything it is trying to delete, and the only way forward is to apply
+# the shared stack back. destroy-all walks them in the order that works.
+#
+# Nothing here happens by accident. Each target prints what it is about to
+# remove and waits for its own name to be typed back; CONFIRM=<target> is the
+# same answer given up front, which is what makes these usable from a script
+# without making them usable by a stray Enter.
+# ---------------------------------------------------------------------------
+
+# Typing the target's own name, rather than y/n: a prompt answered by reflex is
+# not a confirmation. Read from /dev/tty and not stdin, because make is often
+# run with stdin redirected and a `read` that hits EOF returns an empty answer
+# — rejected either way, but reported as if someone had declined.
+define confirm
+if [ "$(CONFIRM)" = "$(1)" ]; then \
+  echo "(confirmed by CONFIRM=$(1))" >&2; \
+elif [ -r /dev/tty ]; then \
+  printf 'Type %s to continue: ' '$(1)' >&2; \
+  read -r reply </dev/tty; \
+  [ "$$reply" = "$(1)" ] || { echo "aborted — nothing was destroyed." >&2; exit 1; }; \
+else \
+  echo "refusing: no terminal to confirm at, and CONFIRM=$(1) was not passed." >&2; \
+  exit 1; \
+fi
+endef
+
+# The two things that stop a destroy, checked before terraform has spent ten
+# minutes deleting the cheap half of the stack and then given up:
+#
+#   - deletion protection. It is an attribute on the live instance and the live
+#     load balancer, and destroy deletes rather than modifies, so passing
+#     -var=db_deletion_protection=false here changes nothing at all: AWS still
+#     refuses, and by then the subnets, the secrets and the service are gone.
+#     It has to come off in an apply first, which is what UNPROTECT=1 does.
+#     Read from the tfvars rather than from AWS because the tfvars is what an
+#     apply would put back — an instance unprotected by hand still has a config
+#     that re-protects it on the next apply.
+#   - a stopped instance. `make db-stop` leaves it in `stopped`, and RDS will
+#     not delete from there; on prod, where a final snapshot is taken, it could
+#     not take one anyway. Asked of AWS, since nothing in the config says it.
+define preflight_destroy
+prot=$$(grep -Ec '^[[:space:]]*(db|app)_deletion_protection[[:space:]]*=[[:space:]]*true' $(1).tfvars 2>/dev/null || true); \
+if [ "$${prot:-0}" -gt 0 ]; then \
+  if [ -n "$(UNPROTECT)" ]; then \
+    echo "==> $(1): taking deletion protection off first" >&2; \
+    $(TF) apply $(TF_VARS) -auto-approve \
+      -var="db_deletion_protection=false" -var="app_deletion_protection=false" \
+      -target=aws_db_instance.main -target=aws_lb.app || exit 1; \
+  else \
+    echo "$(1).tfvars leaves deletion protection on, and a destroy cannot take it" >&2; \
+    echo "  off on the way past — AWS refuses the delete once the rest of the" >&2; \
+    echo "  stack is already gone. Re-run as:" >&2; \
+    echo "    make destroy ENV=$(1) UNPROTECT=1" >&2; \
+    exit 1; \
+  fi; \
+fi; \
+state=$$(aws rds describe-db-instances --region $(AWS_REGION) \
+  --db-instance-identifier $(PROJECT)-$(1) \
+  --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || true); \
+if [ "$$state" = "stopped" ]; then \
+  echo "$(PROJECT)-$(1) is stopped, and RDS will not delete it from there:" >&2; \
+  echo "    make db-start db-wait ENV=$(1)" >&2; \
+  exit 1; \
+fi
+endef
+
+destroy-all: ## Destroy every environment, then the shared stack
+	@echo "This destroys, in order:" >&2
+	@for e in $(ENVS); do \
+	  echo "  $$e — the RDS instance and everything in it, the ECS service, the" >&2; \
+	  echo "        load balancer, the bastion, the SSM parameters, the secrets" >&2; \
+	done
+	@echo "  shared — the VPC and subnets, and the ECR repository with every" >&2
+	@echo "        image in it" >&2
+	@echo "" >&2
+	@for e in $(ENVS); do \
+	  grep -qE '^[[:space:]]*db_skip_final_snapshot[[:space:]]*=[[:space:]]*true' $$e.tfvars 2>/dev/null \
+	    && echo "$$e takes no final snapshot — its data leaves no copy behind." >&2; \
+	done; true
+	@echo "Left standing on purpose: s3://$(BUCKET), the $(LOCK_TABLE) table," >&2
+	@echo "and the GitHub deploy role — those are \`make destroy-bootstrap\`." >&2
+	@$(call confirm,destroy-all)
+	@for e in $(ENVS); do \
+	  echo "" >&2; echo "==> destroy ENV=$$e" >&2; \
+	  $(MAKE) --no-print-directory destroy ENV=$$e || exit 1; \
+	done
+	@echo "" >&2; echo "==> destroy-shared" >&2
+	@$(MAKE) --no-print-directory destroy-shared
+	@echo "" >&2
+	@echo "every stack is gone. The state backend still stands:" >&2
+	@echo "    make destroy-bootstrap" >&2
+
+# Everything `make bootstrap` created, and the only stack whose state is local.
+# That last part is the catch: bootstrap/terraform.tfstate is gitignored, so
+# this works only from the machine that ran `make bootstrap`. Anywhere else it
+# finds an empty state, destroys nothing, and still reports success — so the
+# last line checks the bucket rather than trusting the exit code.
+#
+# Three things have to happen that `terraform destroy` will not do by itself:
+#
+#   - every other stack has to be empty first. Deleting this bucket deletes the
+#     record of what exists; anything still standing afterwards can only be
+#     found by hand, in the console, one service at a time.
+#   - the bucket has to be emptied, version by version. It is versioned, so
+#     `aws s3 rm --recursive` is not enough — the old versions and the delete
+#     markers it leaves behind both keep DeleteBucket answering BucketNotEmpty.
+#     One delete-object per version rather than a batched delete-objects, whose
+#     --delete argument is either inline JSON or a file:// path, and msys
+#     mangles both on the way to a native Windows aws.exe.
+#   - prevent_destroy has to be got around. It takes a literal, not a variable,
+#     so no flag can turn it off; dropping the bucket and its sub-resources out
+#     of state and deleting it afterwards is the intended escape. The state
+#     file is being destroyed in the same breath, so there is nothing to orphan.
+destroy-bootstrap: ## Destroy the state bucket, lock table, and GitHub deploy role
+	@echo "This deletes the Terraform state backend itself:" >&2
+	@echo "  s3://$(BUCKET) — every version of every state file" >&2
+	@echo "  the $(LOCK_TABLE) lock table" >&2
+	@echo "  the hbu-github-deploy role — GitHub Actions deploys stop working" >&2
+	@echo "" >&2
+	@echo "There is no undo, and no state left afterwards to describe whatever" >&2
+	@echo "survived it. Run \`make destroy-all\` first." >&2
+	@echo "" >&2
+	@echo "checking that nothing is left in the state files..." >&2
+	@left=""; \
+	for k in shared $(ENVS); do \
+	  n=$$(aws s3 cp "s3://$(BUCKET)/$(PROJECT)/$$k/terraform.tfstate" - 2>/dev/null \
+	       | grep -c '"mode": "managed"' || true); \
+	  [ "$${n:-0}" -eq 0 ] || { echo "  $$k still holds $$n resources" >&2; left=1; }; \
+	done; \
+	[ -z "$$left" ] || { \
+	  echo "refusing: destroying the backend now would strand them." >&2; \
+	  echo "    make destroy-all" >&2; exit 1; }
+	@echo "  clean." >&2
+	@$(call confirm,destroy-bootstrap)
+	@echo "==> emptying s3://$(BUCKET)" >&2
+	@aws s3api list-object-versions --bucket "$(BUCKET)" \
+	   --query '[Versions, DeleteMarkers][][].[Key, VersionId]' --output text 2>/dev/null \
+	 | while read -r key vid; do \
+	     [ -n "$$key" ] || continue; \
+	     aws s3api delete-object --bucket "$(BUCKET)" --key "$$key" --version-id "$$vid" >/dev/null; \
+	   done
+	@echo "==> dropping the bucket out of state (prevent_destroy takes no flag)" >&2
+	@$(TF_BOOT) init -input=false >/dev/null
+	@for r in aws_s3_bucket.tf_state aws_s3_bucket_versioning.tf_state \
+	          aws_s3_bucket_server_side_encryption_configuration.tf_state \
+	          aws_s3_bucket_public_access_block.tf_state; do \
+	  $(TF_BOOT) state rm "$$r" >/dev/null 2>&1 || true; \
+	done
+	$(TF_BOOT) destroy $(TF_APPROVE)
+	@aws s3api delete-bucket --bucket "$(BUCKET)" --region $(AWS_REGION) 2>/dev/null || true
+	@if aws s3api head-bucket --bucket "$(BUCKET)" 2>/dev/null; then \
+	  echo "s3://$(BUCKET) is still there — delete it by hand." >&2; exit 1; \
+	else echo "s3://$(BUCKET) is gone. Nothing of this project is left in AWS." >&2; fi
 
 # ---------------------------------------------------------------------------
 # Database
