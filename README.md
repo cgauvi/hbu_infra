@@ -51,7 +51,9 @@ and their state key.
 │                │                              │ :8502  /tiles/*        │
 │                │                              ▼ both by security group │
 │  public                                 Fargate task                   │
-│                │                        Streamlit + the map's tiles    │
+│                │                        Streamlit + renderer assets    │
+│                │                        (the tiles: PMTiles on S3,     │
+│                │                         read by the browser directly) │
 │                │ :5432, by security group     │      egress to ECR,    │
 │                │                              │      Secrets Manager,  │
 │                └──────────────┬───────────────┘      HuggingFace       │
@@ -60,9 +62,10 @@ and their state key.
 │           postgis · pgvector · pg_trgm                                 │
 │                                                                        │
 │           rag.chunks       the vector index          DDL: dataplatform │
-│           rag.features  ┐                                              │
-│           rag.lots      ├ the spatial working set    DDL: this repo    │
-│           rag.buildings ┘                                              │
+│           rag.features   ┐                                             │
+│           rag.lots       ├ the spatial working set   DDL: this repo    │
+│           rag.buildings  │                                             │
+│           rag.addresses  ┘                                             │
 │                                                                        │
 │           silver.*  one table per silver asset,      DDL: this repo    │
 │           gold.*    partitioned by (neighborhood,    DDL: this repo    │
@@ -91,11 +94,13 @@ bastion to the database on 5432. A Fargate task's address is assigned at start
 and changes on every deploy, so a CIDR rule could not describe it in the first
 place.
 
-The second task port is the map's geometry: the app draws its layers as vector
-tiles and Streamlit has no route to serve them from, so a tile server runs on
+The second task port carries the map's renderer library and the zoning grid
+PDFs: Streamlit has no route to serve a file from, so a small server runs on
 its own socket in the same container and a listener rule sends `/tiles/*`
-there. See [Two ports, two target
-groups](#two-ports-two-target-groups-the-maps-tiles).
+there. The tiles themselves are PMTiles archives the dataplatform writes to
+S3, which the browser reads directly — see [Two ports, two target
+groups](#two-ports-two-target-groups-the-maps-second-port) and [The map's
+tiles come off S3](#the-maps-tiles-come-off-s3).
 
 That is `dev`. **`prod` is still the public posture** — a public endpoint locked
 to the applying machine's IP, no bastion, and `enable_app = false` — because
@@ -120,12 +125,12 @@ What this repo owns is everything that table cannot create for itself:
 |---|---|
 | `urban_rag`, `urban_rag_ro`, schemas `rag`, `silver`, `gold`, `warehouse`, `dagster` | Creating a role and the schemas it owns needs the master user, and the master credentials are resolved here |
 | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements` | `CREATE EXTENSION` needs `rds_superuser`, which the pipeline's role must not have |
-| `rag.features`, `rag.lots`, `rag.buildings` | The spatial working set: the geometry the joins below are computed over, and the geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes |
+| `rag.features`, `rag.lots`, `rag.buildings`, `rag.addresses` | The spatial working set: the geometry the joins below are computed over, and the geometry the chunks are *about*. `rag.chunks.feature_ids` records which map features cite each document, but it holds ids, not shapes. `rag.addresses` is the newest of the four and the only one created outside `002_spatial.sql`, because it arrived with the table it feeds |
 | `warehouse.ensure_partition`, `warehouse.partitions` | Creates a `silver`/`gold` leaf on demand, and lists the ones that exist — see [How the silver and gold tables are shaped](#how-the-silver-and-gold-tables-are-shaped) |
 | `silver.building_lot_intersections` | Which buildings sit on which lots, computed with `ST_Intersection` — a building spanning several lots gets one row per lot, holding just the clipped slice and its share of the footprint |
 | `silver.lot_features` | Which map features cover which lot — the same clip one layer over, and the hop that gives a lot its documents. A lot has no zoning id to link on: the cadastre is provincial (Infolot, `NO_LOT`) and the zoning is municipal (Spectrum, `NUMERO_COMPLET`), so the two are joined by geometry or not at all |
-| `silver.neighborhood_streets` | The sides of the roadway, from Montreal's *géobase double* — one row per `COTE_RUE_ID`, already clipped to a borough by the pipeline. Lines, so `length_m` rather than `area_m2` |
-| `silver.lot_frontage` | How much of each lot's boundary faces each street side, in metres. Measured on `ST_Boundary(lot)` and not on the lot itself — `ST_Length` of a polygon is 0 — by matching each ~1 m piece of the boundary to its nearest street side within `buffer_m` and keeping the pieces that run within 45° of parallel to it. `frontage_rank = 1` is the street a lot mostly fronts on. Rows whose `buffer_m` is `3.0` predate 2026-08 and were measured by clipping to a buffered street instead, which missed 90 % of a borough's lots and inflated the rest — see the file header |
+| `silver.neighborhood_streets` | The roadway centre lines, from the **RQTT** — the MRNF's province-wide network, which replaced Montreal's *géobase double*, Quebec City's `vque_18` and Saguenay's `sag-reseau-routier` at once, so a new city needs a bounding box rather than a branch. One row per segment, already clipped to a borough by the pipeline. Lines, so `length_m` rather than `area_m2`. `cote_rue_id` holds the RQTT's `AQRP_UUID` — unique across the province, unlike `IdRte`, which carries nulls and duplicates — and that is what the upsert conflicts on. The *name* is a *côté de rue* and nothing here is a side of a street any more: it is kept because it is in two primary keys, denormalised into `gold.lot_profiles` and read by the map's tile queries |
+| `silver.lot_frontage` | How much of each lot's boundary faces the street, in metres. **In Quebec's renewed cadastre the street is a lot**, so the measure is the boundary a parcel *shares* with one of those — `ST_Length(ST_Intersection(ST_Boundary(lot), ST_Boundary(road_lot)))`, taken on the boundary because `ST_Length` of a polygon is 0. Exact: no buffer, no tolerance, no angle test, because abutting parcels in this cadastre share their vertices. The street line is what identifies *which* parcels are the roadway and names the edge, not what measures it. `frontage_rank = 1` is the street a lot mostly fronts on. `buffer_m` is a *reach* and no longer a buffer: rows carrying `3.0` predate 2026-08 and were measured by clipping to a buffered street, which missed 90 % of a borough's lots and inflated the rest — see the file header |
 | `silver.vacancy_rates`, `silver.quartier_vacancy_rates`, `silver.average_rents`, `silver.quartier_average_rents` | One borough's CMHC Rental Market Survey, and the quartier rows each borough figure was averaged over. The average is unweighted — the survey publishes rates and nothing to weight them by — so `num_quartiers` travels on every row as the denominator it was actually taken over |
 | `silver.document_chunks` | The corpus before it is embedded: the text, the token count, and which map features cite it. Every scrape date, unlike `rag.chunks`, which is pruned to the current one |
 | `silver.lot_zone_pieces` | The piece of a lot that one zone governs, as a site in its own right — one row per (lot, zone), carrying the clipped polygon, its area, the street *that piece* faces and its share of what already stands on the parcel. A zoning boundary does not have to follow a lot line, and on a large parcel it usually does not: lot 1 740 794 is 27 044 m² with 24 596 in H04-072 and 2 440 in C04-083, and those are two development sites with two envelopes, two streets and two answers. This is the grain everything downstream of the zoning keys on; `is_primary_zone` marks the largest piece, which is the row a reader wanting one answer per parcel takes, and `footprint_share` is how the roll — which describes a *lot* — is divided between them |
@@ -133,12 +138,23 @@ What this repo owns is everything that table cannot create for itself:
 | `silver.assessment_units` | Every assessed property as the province describes it — one row per *unité d'évaluation* from Quebec's *rôle d'évaluation foncière*, carrying its point, its use code, land and floor area, storeys, year built, dwellings, and the land/building halves of its assessed value. The row-level record `silver.lot_assessed_values` aggregates: that table says what a lot is worth, this one says what is on it. The roll has no borough axis — it is published once for the province — so unlike every other table here its partitions are filled several at a time, by the borough each unit's **point falls inside**; the roll's own `arrond` is kept beside it as a cross-check and never partitioned on. The forty MAMH-coded fields this platform does not name land in `attributes` |
 | `silver.lot_assessed_values` | What each lot is assessed at, from Quebec's *rôle d'évaluation foncière* — the units the roll's own cadastre crosswalk places on the lot, plus (for the divided co-ownerships it cannot place, since those name private lots Infolot does not draw) the ones whose point falls in it. **Two totals**: `total_assessed_value` counts each unit whole on every lot it covers and must not be SUM()ed across lots; `total_assessed_value_apportioned` divides by the lots covered and is the one that adds up. `num_shared_units` is where they differ, `num_units_by_point` how many rows came from the fallback, and both totals are **null**, not 0, on a lot no unit reaches — a lane is not worth nothing, it is unassessed |
 | `gold.lot_profiles` | Every lot in a borough at the grain a question is asked about — one row per parcel, carrying whether a building stands on it and how many, its primary and secondary street frontage, the document that governs it, the zoning envelopes that bound what may be built on it (`zoning_envelopes`), what the ground on it is assessed at from Quebec's rôle (`total_assessed_value`, with `total_assessed_value_apportioned` as the one that may be summed across lots, and `num_assessment_units` beside them because a condominium's common-parts lot carries one unit per apartment), the borough's CMHC vacancy and rent grids (`vacancy_rates`, `average_rents`) and what it costs to build there (`construction_costs`, with the underground and integrated ground-level parking rates flattened into `underground_stall_cost_low/high_cad` and `above_grade_stall_cost_low/high_cad` — dollars per stall — and the configured condominium / apartment band into `condo_cost_low/high_cad_sqft`). The three joins above each hold one row per (lot × something); this is where they collapse onto the lot, alongside `silver.lot_assessed_values` — already one row per lot, so a plain `LEFT JOIN` on `lot_number` — and four more jsonb columns the dataplatform hands in from its geoparquet tree. Replaces an earlier `rag.vacant_lots`, which kept only the parcels it found nothing on and so could answer one question at the cost of hiding every other lot — `WHERE NOT has_building` is that selection now |
+| `silver.lot_buildable_setbacks` | What is left of a lot once its zone's margins are taken off it — one row per (lot, zone, grid column). The boundary is sorted into front, sides and rear, each buffered by the margin that governs it, the union differenced out of the parcel, and the result clipped to the piece that zone governs: a margin comes off a *lot line*, but a zone's rules apply only on its own ground. `footprint_cap_m2` is that envelope or *Taux d'implantation au sol* × piece area, whichever is smaller, and `footprint_cap_binding` names which bound |
+| `silver.lot_addresses` | Every civic address standing on a parcel, at the **(lot, zone)** grain the gold tables are keyed on. Adresses Québec records no lot number on any point, so this spatial join is the only thing that puts an address on a parcel — and it is what lets a map label a site by its street. Keyed on `address_id`; a point on nobody's parcel is counted and not written |
+| `silver.commercial_rents` | One gross rent per `rent_class` for the borough — office and industrial off the Cushman & Wakefield submarket it sits in, retail from a stated base, all three carried to the latest quarter the StatCan index publishes. `rent_basis` says which of the four it is |
+| `silver.lot_assessment_comparables` | What each lot yields on its assessment, and which lots the roll says are like it: the roll's dwellings and floor area summed onto the parcel and split by each unit's own CUBF code, priced into `cap_rate_pct`, plus the k nearest comparables and the `estimated_value_cad` their median ratios imply. `assessed_to_estimated_ratio` is the screen |
+| `silver.lot_development_programs` | What may profitably be built under every zoning envelope — one CP-SAT solve per candidate (lot, zone, grid column), with the mix, the storey split, the footprint, the stalls, the build cost and the `binding` cap that says why the answer is not bigger |
+| `gold.lot_highest_best_use` | The highest and best use of every piece of ground: the program of the *governing* envelope, one row per (lot, zone). `is_primary_zone` marks the largest piece and `hbu_status` names why a piece has no program — a road parcel and an equipment zone get none whatever the zoning permits |
+| `gold.lot_redevelopment_gap` | How far each piece is from that use: the floor standing on it today against what its envelope could hold, by class, in m² and sqft, and the two incomes on one stated NOI definition. Also the three futures priced on one footing — hold, enhance, rebuild — and the owner's `best_future` |
+| `gold.lot_investment_opportunities` | The under-built sites worth looking at first, on two axes: `investment_thesis` (what you would build, ranked on yield on cost) and `site_thesis` (why the parcel is acquirable — brownfield, teardown, infill or improvement, each costing its own demolition, remediation or addition) |
+| `gold.lot_building_massing` | The proposed building of each piece drawn as a rectangle inside its own setback envelope, with `footprint_fit_pct` — the check that a solved *area* has a shape the ground can take |
+| `gold.lot_surface_parking` | The asphalt that building leaves on the yard, as a second polygon: a surface stall is not a building, so it is fitted into the piece rather than into the setback envelope. `geom` can be a MultiPolygon and `num_parking_bays` says in how many pieces |
+| `gold.map_cell_aggregates` | Every gated map layer dissolved onto the Web Mercator tile grid, so a borough-wide view has something true to draw rather than nothing. One row per (layer, cell), keyed on `(layer, cell_z, cell_x, cell_y)` |
 | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot` | The joins from geometry to vectors |
 | `rag.lot_documents`, `rag.search_at_lot_number` | The same joins entered from a lot number rather than a point, off the precomputed `silver.lot_features` |
 
 Every `silver.*` and `gold.*` table is filled by **hbu_dataplatform** through
-`urban_rag.warehouse`, which is their single writer; the three `rag.*` tables
-are filled by `urban_rag.postgis`, the same repo one layer down.
+`urban_rag.warehouse`, which is their single writer; the four `rag.*` working-set
+tables are filled by `urban_rag.postgis`, the same repo one layer down.
 
 The role, the schemas and the grants are [`sql/000_roles.sql`](sql/000_roles.sql).
 It sorts first, so `db-init` applies it ahead of everything else; `db-bootstrap`
@@ -804,19 +820,22 @@ then fail on its first question.
 accepts inbound **only** from the ALB's security group, so the public IP
 carries egress and answers nothing.
 
-### Two ports, two target groups: the map's tiles
+### Two ports, two target groups: the map's second port
 
-The app serves on one port and the map's geometry on another, and the ALB has
-a rule that separates them. It is worth explaining because "one service, two
-target groups" is unusual enough to look like an accident.
+The app serves on one port and a handful of the map's files on another, and
+the ALB has a rule that separates them. It is worth explaining because "one
+service, two target groups" is unusual enough to look like an accident.
 
 `hbu_rag_map` draws its lots, footprints, zones and massing as Mapbox Vector
 Tiles rather than as GeoJSON embedded in the page — that repo's README has the
 why, and the short version is that a page carrying a borough's cadastre is a
-page that stops responding. Leaflet fetches those tiles over HTTP from inside
-the map, and **Streamlit serves no routes of its own**, so the app runs a small
-tile server on a second socket in the same process. This stack's whole job is
-to put that socket somewhere the browser can reach it:
+page that stops responding. The renderer for those tiles is two JavaScript
+libraries the page has to fetch before it draws anything, and the Regulations
+pane publishes the zoning grid PDFs it has fetched so a browser can open them
+from an `https://` page. **Streamlit serves no routes of its own**, so the app
+runs a small HTTP server on a second socket in the same process for exactly
+those. This stack's job is to put that socket somewhere the browser can reach
+it:
 
 ```
                  ALB listener
@@ -828,45 +847,85 @@ to put that socket somewhere the browser can reach it:
        └──────────── same task ───────┘
 ```
 
-One task, registered twice. Not a second service, because the tile server *is*
-the app process: it borrows the same connection pool, the same resolved
-endpoint, the same `verify-full` posture, and it would gain nothing from a
-container of its own but a second copy of all of that to keep in step.
+One task, registered twice. Not a second service, because that server *is*
+the app process: it holds the grids the pane fetched, it knows the password
+the key is derived from, and it would gain nothing from a container of its own
+but a second copy of all of that to keep in step.
 
 **The two target groups are configured as opposites, and every difference is
-one fact read twice: a tile request is stateless.** The app's group is sticky,
-because session state lives in a task's memory and a reconnecting websocket has
-to land back on it. The tile group is not, because a tile is a pure function of
-its URL — pinning them would only bunch every tile onto whichever task the
-first request happened to reach. It health-checks `/tiles/healthz` rather than
-`/_stcore/health`, and drains in ten seconds rather than thirty, since a tile
-is milliseconds and not a streamed answer.
+one fact read twice: a request on the second port is stateless.** The app's
+group is sticky, because session state lives in a task's memory and a
+reconnecting websocket has to land back on it. The other is not, because a
+library or a grid is a pure function of its URL — pinning would only bunch
+every request onto whichever task the first happened to reach. It
+health-checks `/tiles/healthz` rather than `/_stcore/health`, and drains in ten
+seconds rather than thirty, since a file is milliseconds and not a streamed
+answer.
 
-**A listener rule does not make the tiles public.** Every tile URL carries a
+**A listener rule does not make the grids public.** Every grid URL carries a
 key `hbu_rag_map` derives from the same `HBU_APP_PASSWORD` this stack injects
-from Secrets Manager — an HMAC of it, never the password — and the tile server
-refuses a request without one. That is what keeps a path rule from putting the
-cadastre and a solved development programme on the internet. It is *derived*
-rather than random precisely so every task computes the same one, which is what
-makes the missing stickiness above safe. `/tiles/healthz` is the only path
-outside the check, because a health check carries no credentials.
+from Secrets Manager — an HMAC of it, never the password — and the server
+refuses a request without one. It is *derived* rather than random precisely so
+every task computes the same one, which is what makes the missing stickiness
+above safe. `/tiles/healthz` and the two vendored libraries are the only paths
+outside the check: a health check carries no credentials, and public MIT and
+BSD code carries no cadastre.
 
 `HBU_TILE_BASE_URL` is set to the empty string in the task definition, and that
-is the whole of what tells the app it is behind a load balancer: the tile URLs
-come out relative (`/tiles/lots/{z}/{x}/{y}.mvt`), so they resolve against
-whatever DNS name the ALB is reached by and nothing in this repo has to know
-it. A laptop leaves the variable unset and gets an absolute
-`http://localhost:8502` instead, because there Streamlit and the tiles really
-are two origins.
+is the whole of what tells the app it is behind a load balancer: the URLs for
+that port come out relative (`/tiles/vendor/...`, `/tiles/grid/...`), so they
+resolve against whatever DNS name the ALB is reached by and nothing in this
+repo has to know it. A laptop leaves the variable unset and gets an absolute
+`http://localhost:8502` instead, because there Streamlit and that server
+really are two origins.
 
 `app_tile_port` and `app_tile_path_pattern` are the two knobs. The port has to
 agree with the container's `HBU_TILE_PORT`, which the task definition also
-sets, so there is one number in one place.
+sets, so there is one number in one place. The prefix is historical — the
+tiles themselves used to be rendered on this port, one PostGIS query per
+square — and it is kept because it is in the rule, the health path and every
+URL the app writes.
 
 **Checking it after a deploy:** `terraform output app_tiles_health_url` and
-fetch it. A 200 says the rule reaches the task's second port. A tile itself
-needs the key, so that path is the only part of the endpoint that answers
-unauthenticated — which makes it exactly the right thing to curl.
+fetch it. A 200 says the rule reaches the task's second port. A grid needs the
+key, so the health path and the libraries are the only parts of the endpoint
+that answer unauthenticated — which makes the health path exactly the right
+thing to curl.
+
+### The map's tiles come off S3
+
+The geometry itself does not pass through this stack at all. The dataplatform's
+`map_tiles` asset renders every map layer as vector tiles — with the same
+`ST_AsMVT` query the app used to run per request — and packs each layer into one
+**PMTiles** archive per `(scrape_date, borough)` partition, written into the
+pipeline's own bucket under `<env>/gold/map_tiles/`. A PMTiles file carries its
+own directory, so the browser fetches any one tile with a byte-range request
+against a static object: no tile server, no database, and nothing in the
+request path that a pan can slow down.
+
+[`tiles.tf`](tiles.tf) is the two things the bucket needs for that:
+
+- **the task role may read the archives** under the prefix, and nothing else
+  in the tree. The bucket stays private; the app presigns a URL per archive
+  with its own credentials, for `app_tiles_presign_seconds`, so the tiles are
+  exactly as reachable as the app is and no more — a presigned URL comes from
+  a page, and a page is what the password gate hands out. `ListBucket` is
+  granted on the prefix too, only so a missing archive reads as a 404 rather
+  than a 403 and the app can say "not built yet" instead of "not allowed";
+- **a CORS rule**, because the page is served from the load balancer's origin
+  and the archive from S3's, and a `Range` header is not on the browser's
+  safelist — every read is preflighted. The rule allows `GET`/`HEAD` from
+  `app_tiles_cors_origins` (`*` by default, safe while the objects are
+  private) and *exposes* `ETag`, `Content-Range`, `Content-Length` and
+  `Accept-Ranges`, which the PMTiles reader checks on every range response.
+
+The bucket is the dataplatform's and is not created here; `app_tiles_bucket`
+names it and `app_tiles_prefix` overrides the `<environment>/gold/map_tiles`
+default. The task definition hands the app `HBU_TILES_URL` as the resulting
+`s3://bucket/prefix`, which is also `terraform output app_tiles_url`. Leave the
+bucket unset and none of this is created: the app draws its capped GeoJSON
+fallback and says why in the sidebar. A snapshot the asset has not run for
+gets the same fallback with a note naming `make map_tiles`.
 
 ### HTTPS, and pointing a domain at it
 
@@ -1125,8 +1184,9 @@ only register a given provider URL once. Deleting it would break that project.
 | [`ssm.tf`](ssm.tf) | The `/hbu-<env>/db/*` contract, the app-role secret, the IAM policy for readers |
 | [`bastion.tf`](bastion.tf) | Optional SSM jump host (`enable_bastion`) |
 | [`schedule.tf`](schedule.tf) | Optional overnight stop/start (`enable_scheduled_shutdown`) |
-| [`alb.tf`](alb.tf) | The public load balancer, its security group, the app and tile target groups, the 80/443 listeners `app_certificate_arn` switches between, and the `/tiles/*` rule (`enable_app`) |
+| [`alb.tf`](alb.tf) | The public load balancer, its security group, the app and `/tiles/*` target groups, the 80/443 listeners `app_certificate_arn` switches between, and the `/tiles/*` rule (`enable_app`) |
 | [`ecs.tf`](ecs.tf) | The Fargate cluster, task definition (both ports), service (both target groups), task IAM roles, and the two application secrets |
+| [`tiles.tf`](tiles.tf) | Read on the dataplatform bucket's `gold/map_tiles` prefix for the task role, and the CORS rule the browser's range requests need (`app_tiles_bucket`) |
 | [`outputs.tf`](outputs.tf) | Connection details, the app URL, and the ALB's DNS name and zone for a CNAME or alias record |
 | [`sql/`](sql/) | Extensions, the `rag` working set, the partitioned `silver`/`gold` tables and the function that creates their partitions, spatial search functions |
 | [`scripts/db.py`](scripts/db.py) | The CLI everything above is driven through |
@@ -1141,21 +1201,37 @@ numbers are what say what has to exist before what:
 | File | Creates | Needs first |
 |---|---|---|
 | [`000_roles.sql`](sql/000_roles.sql) | `urban_rag`, `urban_rag_ro`, the five schemas, the grants | the master user |
-| [`001_extensions.sql`](sql/001_extensions.sql) | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements`, and a notice if PostGIS is too old for the map's vector tiles | `rds_superuser` |
+| [`001_extensions.sql`](sql/001_extensions.sql) | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements`, and a notice if PostGIS is too old for the dataplatform to render the map's vector tiles | `rds_superuser` |
 | [`002_spatial.sql`](sql/002_spatial.sql) | `rag.features`, `rag.lots`, `rag.buildings` | 001, for `geometry` |
 | [`003_spatial_search.sql`](sql/003_spatial_search.sql) | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot`, `rag.corpus_status` | `rag.chunks` — *skipped until it exists* |
 | [`003_warehouse.sql`](sql/003_warehouse.sql) | `warehouse.ensure_partition`, `warehouse.partitions` | 000 |
-| [`004_silver_building_lots.sql`](sql/004_silver_building_lots.sql) | `silver.building_lot_intersections` | 002, 003_warehouse |
+| [`004_silver_building_lots.sql`](sql/004_silver_building_lots.sql) | `silver.building_lot_intersections` | 003_warehouse, and `rag.buildings` — *header* |
 | [`005_silver_lot_features.sql`](sql/005_silver_lot_features.sql) | `silver.lot_features`, and widens `rag.features`'s uniqueness to the borough | 002, 003_warehouse |
 | [`006_lot_documents.sql`](sql/006_lot_documents.sql) | `rag.lot_documents`, `rag.search_at_lot_number` | 005 **and** `rag.chunks` — *skipped until it exists* |
 | [`007_silver_streets.sql`](sql/007_silver_streets.sql) | `silver.neighborhood_streets` | 003_warehouse |
-| [`008_silver_lot_frontage.sql`](sql/008_silver_lot_frontage.sql) | `silver.lot_frontage` | 002, 007 |
+| [`008_silver_lot_frontage.sql`](sql/008_silver_lot_frontage.sql) | `silver.lot_frontage` | 002, and `silver.neighborhood_streets` from 007 — *header* |
 | [`009_gold_lot_profiles.sql`](sql/009_gold_lot_profiles.sql) | `gold.lot_profiles` | 002, 003_warehouse |
 | [`010_silver_cmhc.sql`](sql/010_silver_cmhc.sql) | the four CMHC tables | 003_warehouse |
 | [`011_silver_corpus.sql`](sql/011_silver_corpus.sql) | `silver.document_chunks` | 003_warehouse |
 | [`012_silver_zoning.sql`](sql/012_silver_zoning.sql) | `silver.zoning_grid_columns`, `silver.lot_zoning_envelopes` | 003_warehouse |
 | [`013_silver_lot_assessed_values.sql`](sql/013_silver_lot_assessed_values.sql) | `silver.lot_assessed_values` | 001, for `geometry`; 003_warehouse |
 | [`014_silver_assessment_units.sql`](sql/014_silver_assessment_units.sql) | `silver.assessment_units` | 001, for `geometry`; 003_warehouse |
+| [`015_silver_lot_buildable_setbacks.sql`](sql/015_silver_lot_buildable_setbacks.sql) | `silver.lot_buildable_setbacks` | 001, for `geometry`; 003_warehouse |
+| [`016_silver_lot_assessment_comparables.sql`](sql/016_silver_lot_assessment_comparables.sql) | `silver.lot_assessment_comparables` | 001, for `geometry`; 003_warehouse |
+| [`017_silver_lot_development_programs.sql`](sql/017_silver_lot_development_programs.sql) | `silver.lot_development_programs` | 003_warehouse |
+| [`018_gold_lot_highest_best_use.sql`](sql/018_gold_lot_highest_best_use.sql) | `gold.lot_highest_best_use` | 003_warehouse |
+| [`019_gold_lot_redevelopment_gap.sql`](sql/019_gold_lot_redevelopment_gap.sql) | `gold.lot_redevelopment_gap` | 003_warehouse |
+| [`020_silver_commercial_rents.sql`](sql/020_silver_commercial_rents.sql) | `silver.commercial_rents` | 003_warehouse |
+| [`021_gold_lot_investment_opportunities.sql`](sql/021_gold_lot_investment_opportunities.sql) | `gold.lot_investment_opportunities` | 003_warehouse |
+| [`022_gold_lot_building_massing.sql`](sql/022_gold_lot_building_massing.sql) | `gold.lot_building_massing` | 001, for `geometry`; 003_warehouse |
+| [`023_gold_map_cell_aggregates.sql`](sql/023_gold_map_cell_aggregates.sql) | `gold.map_cell_aggregates` | 001, for `geometry`; 003_warehouse |
+| [`024_gold_lot_surface_parking.sql`](sql/024_gold_lot_surface_parking.sql) | `gold.lot_surface_parking` | 001, for `geometry`; 003_warehouse |
+| [`025_silver_lot_zone_pieces.sql`](sql/025_silver_lot_zone_pieces.sql) | `silver.lot_zone_pieces` | 001, for `geometry`; 003_warehouse |
+| [`026_silver_lot_addresses.sql`](sql/026_silver_lot_addresses.sql) | `rag.addresses` **and** `silver.lot_addresses` | 001, for `geometry`; 003_warehouse |
+
+The numbers are the dependency order and nothing else reads them: `db.py init`
+sorts the directory and applies it, so a new table is a new file at the end
+rather than an edit to an existing one.
 
 `003_warehouse.sql` sorting *after* `003_spatial_search.sql` is name order doing
 its job rather than a collision: `s` < `w`, and everything from `004` on needs
@@ -1173,9 +1249,20 @@ A file may also declare a relation it cannot be *parsed* without:
 ```
 
 `db.py` checks that relation with `to_regclass` and skips the file with a note
-if it is missing, rather than failing. Two files carry that header today, and
-both for the same reason: a SQL-language function body is parsed at `CREATE`
-time, so neither can be created before the dataplatform's table exists — and a
-hard error on the first run of a new database would be noise rather than
+if it is missing, rather than failing. Four files carry that header today, for
+two different reasons.
+
+`003_spatial_search.sql` and `006_lot_documents.sql` both name `rag.chunks`,
+which belongs to the dataplatform: a SQL-language function body is parsed at
+`CREATE` time, so neither can be created before that table exists — and a hard
+error on the first run of a new database would be noise rather than
 information. Re-run `db-init` after the first `document_index` materialization
 and they land.
+
+`004_silver_building_lots.sql` names `rag.buildings` and
+`008_silver_lot_frontage.sql` names `silver.neighborhood_streets`, and both of
+those are created by an earlier file in this same directory — `002` and `007`.
+The header states a dependency the numbers already encode, so that a file
+skipped upstream produces a named skip here rather than a failure further in:
+`004` carries a real foreign key on `rag.buildings` and would raise without it,
+and `008` would create a `lot_frontage` with nothing to join to.

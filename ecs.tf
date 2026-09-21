@@ -70,15 +70,18 @@ resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   ip_protocol                  = "tcp"
 }
 
-# The map's vector tiles, off a second socket in the same container. Still ALB
-# only: the tile server has its own access key, but a port reachable from the
-# VPC would be one more thing standing between the cadastre and the internet
-# than there needs to be.
+# The map's second socket in the same container: the vector renderer's own
+# JavaScript, the zoning grid PDFs the Regulations pane publishes, and the
+# health path. The tiles themselves no longer come through here — they are
+# PMTiles archives the browser reads off S3, see tiles.tf — but the routes
+# that remain still have to be reachable from the page. Still ALB only: a
+# port reachable from the VPC would be one more thing standing between the
+# cadastre and the internet than there needs to be.
 resource "aws_vpc_security_group_ingress_rule" "app_tiles_from_alb" {
   count = var.enable_app ? 1 : 0
 
   security_group_id            = aws_security_group.app[0].id
-  description                  = "Map vector tiles from the load balancer"
+  description                  = "Map renderer assets and grids from the load balancer"
   referenced_security_group_id = aws_security_group.alb[0].id
   from_port                    = var.app_tile_port
   to_port                      = var.app_tile_port
@@ -330,8 +333,9 @@ resource "aws_ecs_task_definition" "app" {
           containerPort = var.app_port
           protocol      = "tcp"
         },
-        # The map's tile server. One container, two sockets — see the tile
-        # target group in alb.tf for why it is not a second service.
+        # The map's second socket: the renderer's library and the grid PDFs.
+        # One container, two sockets — see the tile target group in alb.tf
+        # for why it is not a second service.
         {
           containerPort = var.app_tile_port
           protocol      = "tcp"
@@ -358,15 +362,24 @@ resource "aws_ecs_task_definition" "app" {
         { name = "APP_ENV", value = var.app_env_mode },
         { name = "LOG_LEVEL", value = var.app_log_level },
 
-        # The map's vector tiles. The port has to agree with the portMapping
+        # The map's second socket. The port has to agree with the portMapping
         # above and the tile target group in alb.tf; the empty base URL is what
-        # tells hbu_rag_map to write *relative* tile URLs, which is correct
-        # here and only here — `/tiles/...` resolves against whatever DNS name
-        # the load balancer is reached by, so nothing in this file has to know
-        # it. A laptop, with no ALB in front of it, leaves this unset and gets
-        # an absolute http://localhost:8502 instead.
+        # tells hbu_rag_map to write *relative* URLs for what it serves there —
+        # the renderer's library and the grid PDFs — which is correct here and
+        # only here: `/tiles/...` resolves against whatever DNS name the load
+        # balancer is reached by, so nothing in this file has to know it. A
+        # laptop, with no ALB in front of it, leaves this unset and gets an
+        # absolute http://localhost:8502 instead.
         { name = "HBU_TILE_PORT", value = tostring(var.app_tile_port) },
         { name = "HBU_TILE_BASE_URL", value = "" },
+
+        # Where the map's tiles are: the dataplatform's archives on S3, read
+        # with the task role and presigned per archive — see tiles.tf. Empty
+        # when no bucket is configured, which the app reads as "draw the
+        # GeoJSON fallback and say so".
+        { name = "HBU_TILES_URL", value = local.tiles_url },
+        { name = "HBU_TILES_PRESIGN_SECONDS", value = tostring(var.app_tiles_presign_seconds) },
+        { name = "HBU_TILES_REGION", value = var.aws_region },
       ]
 
       secrets = [

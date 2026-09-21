@@ -114,8 +114,13 @@ output "app_url" {
   ])
 }
 
+output "app_tiles_url" {
+  description = "Where the map's tile archives are read from — the dataplatform bucket and prefix the task role may read, as the HBU_TILES_URL the container is given. Empty when app_tiles_bucket is unset, and the map then draws its capped GeoJSON fallback."
+  value       = local.tiles_url
+}
+
 output "app_tiles_health_url" {
-  description = "The map's vector tile server, through the ALB. A 200 here says the /tiles/* listener rule reaches the task's second port; a tile itself needs the key hbu_rag_map derives from the access password, so this health path is the only part of the tile endpoint that answers unauthenticated."
+  description = "The map's second port, through the ALB. A 200 here says the /tiles/* listener rule reaches the task; what that port carries now is the vector renderer's JavaScript and the grid PDFs, not the tiles, which the browser reads off S3 (see app_tiles_url). A grid needs the key hbu_rag_map derives from the access password, so this health path and the two libraries are the only parts of it that answer unauthenticated."
   value = one([
     for lb in aws_lb.app :
     format(

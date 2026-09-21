@@ -33,10 +33,22 @@ db_backup_retention_days = 1
 db_deletion_protection   = false
 db_skip_final_snapshot   = true
 
-# Off by default: a stopped instance makes `make db-*` hang on connect rather
-# than fail, which is a confusing first experience. Turn it on once the shape
-# of the work is familiar.
-enable_scheduled_shutdown = false
+# On, 07:00-22:30 America/Montreal. The instance is a db.m6g.large (see above),
+# roughly 10x a t4g.micro per hour, so the 8.5 idle hours overnight are the
+# largest single line on this stack's bill.
+#
+# The caveat the module header gives still applies: a stopped instance makes
+# `make db-*` hang on connect rather than fail. Outside the window that hang is
+# the schedule, not the tunnel.
+#
+# NOTE: every Dagster schedule in the dataplatform fires between 04:00 and
+# 07:00 on the 1st, i.e. inside this outage. Harmless while the pipeline is
+# laptop-only and the daemon is not left running, but the band has to move
+# before anything schedules itself. `0 7 1 * *` is the worst of them: it lands
+# exactly on the start, and RDS takes minutes to accept connections afterwards.
+enable_scheduled_shutdown = true
+start_cron                = "cron(0 7 * * ? *)"
+stop_cron                 = "cron(30 22 * * ? *)"
 
 # Required by the above: with no public endpoint this is the only path from a
 # laptop. `make db-tunnel` port-forwards through it over Session Manager, and
@@ -84,3 +96,10 @@ app_env_mode = "prod"
 # `make app-shell` opens a shell in the running task over SSM — the fastest way
 # to find out why a connection the logs do not explain is failing.
 app_enable_execute_command = true
+
+# The map's tiles: the dataplatform's own bucket, under `dev/gold/map_tiles`
+# (the default prefix for this environment). Grants the task role read there
+# and puts the CORS rule on the bucket - see tiles.tf. The archives are what
+# `make map_tiles` in hbu_dataplatform writes; until it has run for a
+# snapshot the map says so and draws its capped GeoJSON fallback.
+app_tiles_bucket = "urban-rag-dataplatform"

@@ -323,3 +323,31 @@ variable "app_container_insights" {
   type        = bool
   default     = false
 }
+
+# ---------------------------------------------------------------------------
+# The map's tiles — see tiles.tf
+# ---------------------------------------------------------------------------
+
+variable "app_tiles_bucket" {
+  description = "The dataplatform's S3 bucket, where its `map_tiles` asset writes one PMTiles archive per map layer per partition. The task role is granted read under app_tiles_prefix and the bucket gets the CORS rule the browser's range requests need; the app presigns a URL per archive. Empty leaves all of that uncreated and the map on its capped GeoJSON fallback."
+  type        = string
+  default     = ""
+}
+
+variable "app_tiles_prefix" {
+  description = "Where the archives sit inside app_tiles_bucket, without a leading or trailing slash. Empty means `<environment>/gold/map_tiles`, which is where the dataplatform writes them when its URBAN_RAG_ENV matches this stack's environment."
+  type        = string
+  default     = ""
+}
+
+variable "app_tiles_cors_origins" {
+  description = "Origins the bucket answers cross-origin range requests from. `*` is safe while the objects are private and read through presigned URLs; narrow it to the app's own https://... origin once a domain is in front of the load balancer."
+  type        = list(string)
+  default     = ["*"]
+}
+
+variable "app_tiles_presign_seconds" {
+  description = "How long a presigned archive URL is valid. The app reuses one for half of this so a rerun does not hand the browser a new address for bytes it has already cached; an hour outlives a session and is short enough that a leaked URL is worth little."
+  type        = number
+  default     = 3600
+}

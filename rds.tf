@@ -27,12 +27,18 @@ resource "aws_db_parameter_group" "main" {
   description = "Postgres parameters for ${local.prefix}"
 
   # Reject non-TLS connections. RDS defaults this to 1 already; it is restated
-  # so the guarantee survives a change of engine default. Dynamic, so it takes
-  # effect without a reboot.
+  # so the guarantee survives a change of engine default.
+  #
+  # `pending-reboot`, not `immediate`: on PostgreSQL 15 and later RDS makes
+  # this a *static* parameter, so whatever apply method is asked for, the API
+  # reports it back as pending-reboot — and `immediate` here was a change
+  # every plan proposed and every apply failed to make stick. The value is
+  # the engine default, so nothing about the running instance changes either
+  # way; this only says what Terraform should expect to read back.
   parameter {
     name         = "rds.force_ssl"
     value        = "1"
-    apply_method = "immediate"
+    apply_method = "pending-reboot"
   }
 
   # Log anything slower than 2s. A vector search that quietly fell back to a

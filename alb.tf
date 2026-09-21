@@ -69,7 +69,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_tiles" {
   count = var.enable_app ? 1 : 0
 
   security_group_id            = aws_security_group.alb[0].id
-  description                  = "Forward map tile requests to the application tasks"
+  description                  = "Forward /tiles/* requests to the application tasks"
   referenced_security_group_id = aws_security_group.app[0].id
   from_port                    = var.app_tile_port
   to_port                      = var.app_tile_port
@@ -150,32 +150,36 @@ resource "aws_lb_target_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# The map's tiles
+# The map's second port: `/tiles/*`
 #
 # A second target group on the same tasks, and the reason there are two rather
-# than one is that Streamlit does not serve routes. The map draws its lots,
-# footprints, zones and massing as Mapbox Vector Tiles, which Leaflet fetches
-# over HTTP from inside the page — so hbu_rag_map runs a small tile server on
-# a second socket in the same process and this sends `/tiles/*` to it.
+# than one is that Streamlit does not serve routes. The map's vector renderer
+# needs two JavaScript libraries the page has to fetch before it draws
+# anything, and the Regulations pane publishes the zoning grid PDFs it has
+# fetched so a browser can open them from an https:// page — so hbu_rag_map
+# runs a small HTTP server on a second socket in the same process and this
+# sends `/tiles/*` to it. The prefix is historical: the tiles themselves used
+# to be rendered here, one PostGIS query per square. They are PMTiles archives
+# on S3 now (see tiles.tf), fetched by the browser directly, and this port
+# carries only what has to come from the app's own origin.
 #
 # Everything about this group is the opposite of the app's, and each difference
-# is the same fact read twice: **a tile request is stateless.**
+# is the same fact read twice: **a request here is stateless.**
 #
 #   no stickiness — the app's group has it because session state lives in a
-#     task's memory and a reconnecting websocket must land back on it. A tile
-#     is a pure function of its URL, so any task may answer any tile, and
-#     pinning them would only bunch them onto one.
-#   its own health path — `/tiles/healthz`, which the tile server answers
-#     without the access key, because a health check carries no credentials.
-#   a longer deregistration delay is unnecessary — a tile is milliseconds, not
-#     a streamed answer — so this drains faster than the app.
+#     task's memory and a reconnecting websocket must land back on it. A
+#     library or a grid is a pure function of its URL, so any task may answer,
+#     and pinning would only bunch every request onto one.
+#   its own health path — `/tiles/healthz`, answered without the access key,
+#     because a health check carries no credentials.
+#   a longer deregistration delay is unnecessary — a response is milliseconds,
+#     not a streamed answer — so this drains faster than the app.
 #
-# The tiles are not public: every URL carries a key hbu_rag_map derives from
+# The grids are not public: their URLs carry a key hbu_rag_map derives from
 # the same HBU_APP_PASSWORD the UI asks for, and the server refuses a request
-# without it. That is what keeps a listener rule from putting the cadastre and
-# a solved development programme on the internet. It is derived rather than
-# random precisely so that every task computes the same one — which is what
-# makes "no stickiness" above safe.
+# without it. The libraries are — public MIT and BSD code that carries no
+# cadastre. The key is derived rather than random precisely so that every
+# task computes the same one — which is what makes "no stickiness" safe.
 # ---------------------------------------------------------------------------
 
 resource "aws_lb_target_group" "tiles" {

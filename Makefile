@@ -107,6 +107,26 @@ ifneq (,$(strip $(AWS_CA_BUNDLE)))
 export AWS_CA_BUNDLE
 endif
 
+# And the same absence breaks the CLI outright, not just its trust store. AWS
+# CLI v2 imports awscli/telemetry.py at startup, which calls pathlib.Path.home()
+# at module scope; on Windows that reads USERPROFILE, then HOMEDRIVE+HOMEPATH,
+# and msys2 make forwards none of the three — only a POSIX $(HOME) of
+# /home/<user> that a Windows binary cannot use. So aws.exe dies with
+#
+#     RuntimeError: Could not determine home directory.
+#     [PYI-...:ERROR] Failed to execute script 'aws' due to unhandled exception!
+#
+# before it parses an argument — and since aws-check keeps only the last line
+# of that traceback, every target reports working credentials as unresolvable.
+# Older CLI builds had no telemetry module and survived, so this arrives with a
+# CLI upgrade rather than with any change here. Terraform needs it too: the AWS
+# provider finds ~/.aws through Go's os.UserHomeDir(), which on Windows reads
+# USERPROFILE and nothing else, so without this the backend authenticates as
+# nobody and ACCOUNT_ID below comes back empty.
+ifneq (,$(WIN_HOME))
+export USERPROFILE := $(WIN_HOME)
+endif
+
 # `export` above reaches recipes but not $(shell) — confirmed on make 4.3: a
 # recipe sees the exported value, the shell function sees an empty string. So
 # every $(shell) that talks to AWS has to carry the profile and the CA bundle
@@ -114,7 +134,8 @@ endif
 # look like a credentials error at the call site: the command runs as whatever
 # the *default* profile is, which is a different account, and comes back with a
 # 403 or an empty result that the caller then misreports as missing state.
-AWS_SHELL_ENV = AWS_PROFILE=$(AWS_PROFILE) $(if $(AWS_CA_BUNDLE),AWS_CA_BUNDLE=$(AWS_CA_BUNDLE))
+AWS_SHELL_ENV = AWS_PROFILE=$(AWS_PROFILE) $(if $(AWS_CA_BUNDLE),AWS_CA_BUNDLE=$(AWS_CA_BUNDLE)) \
+                $(if $(WIN_HOME),USERPROFILE=$(WIN_HOME))
 
 # Derived from whichever credentials are active, so the backend never has to be
 # committed and switching AWS_PROFILE switches accounts cleanly. Without the

@@ -56,3 +56,8 @@ app_deletion_protection = true
 
 # A shell inside the task role, on the environment holding real data. Off.
 app_enable_execute_command = false
+
+# The map's tiles, once the pipeline writes a prod slice: the same bucket
+# under `prod/gold/map_tiles`, which is the default prefix for this
+# environment. Narrow app_tiles_cors_origins to the app's domain here.
+#   app_tiles_bucket = "urban-rag-dataplatform"

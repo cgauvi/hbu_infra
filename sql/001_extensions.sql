@@ -32,9 +32,12 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 -- PostGIS 3.1, for the map
 --
 -- hbu_rag_map draws its lots, footprints, zones and massing as Mapbox Vector
--- Tiles, which is `ST_AsMVT` plus the five-argument `ST_TileEnvelope` — the
--- one with a `margin`, added in 3.1. Both come with PostGIS itself, so there
--- is nothing to install; what there is, is a version to be on.
+-- Tiles, rendered by the dataplatform's `map_tiles` asset with `ST_AsMVT`
+-- plus the five-argument `ST_TileEnvelope` — the one with a `margin`, added
+-- in 3.1 — and packed into PMTiles archives on S3. Both functions come with
+-- PostGIS itself, so there is nothing to install; what there is, is a version
+-- to be on. The map itself no longer runs either: a database too old for them
+-- fails that asset, not the map.
 --
 -- A notice rather than a failure, because everything else in this database
 -- works on an older PostGIS and the app has a fallback: it draws GeoJSON by
