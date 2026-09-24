@@ -89,8 +89,23 @@ CREATE TABLE IF NOT EXISTS silver.zoning_grid_columns (
     site_coverage_max_pct        double precision,
     density_min                  double precision,
     density_max                  double precision,
+    -- Quebec City's *Nb de log. à l'hectare min/max*, and NULL on every
+    -- Montreal and Saguenay row. A dwelling count per hectare of lot, which
+    -- is NOT the floor-area ratio above: the ratio bounds floor area and this
+    -- bounds the unit count. A stated 0 is a stated zero — 883 of the city's
+    -- zones print 0/0 and all but four authorise no dwelling group at all —
+    -- so do not read it as "unstated".
+    dwelling_density_min_per_ha  double precision,
+    dwelling_density_max_per_ha  double precision,
     max_dwellings                double precision,
     specific_use_area_max_m2     double precision,
+    -- Also Quebec City's: *Superficie maximale de plancher*, per building, for
+    -- the commerce family. The grid prints it twice — *Vente au détail* and
+    -- *Administration* — and this is the tighter of the two, so no split of
+    -- the one commerce quantity the solver carries can breach either. Distinct
+    -- from specific_use_area_max_m2 above, which is Montreal's *Superficie des
+    -- usages spécifiques*.
+    commercial_floor_max_m2      double precision,
     front_margin_min_m           double precision,
     front_margin_max_m           double precision,
     secondary_front_margin_min_m double precision,
@@ -253,8 +268,23 @@ CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     site_coverage_max_pct        double precision,
     density_min                  double precision,
     density_max                  double precision,
+    -- Quebec City's *Nb de log. à l'hectare min/max*, and NULL on every
+    -- Montreal and Saguenay row. A dwelling count per hectare of lot, which
+    -- is NOT the floor-area ratio above: the ratio bounds floor area and this
+    -- bounds the unit count. A stated 0 is a stated zero — 883 of the city's
+    -- zones print 0/0 and all but four authorise no dwelling group at all —
+    -- so do not read it as "unstated".
+    dwelling_density_min_per_ha  double precision,
+    dwelling_density_max_per_ha  double precision,
     max_dwellings                double precision,
     specific_use_area_max_m2     double precision,
+    -- Also Quebec City's: *Superficie maximale de plancher*, per building, for
+    -- the commerce family. The grid prints it twice — *Vente au détail* and
+    -- *Administration* — and this is the tighter of the two, so no split of
+    -- the one commerce quantity the solver carries can breach either. Distinct
+    -- from specific_use_area_max_m2 above, which is Montreal's *Superficie des
+    -- usages spécifiques*.
+    commercial_floor_max_m2      double precision,
     front_margin_min_m           double precision,
     front_margin_max_m           double precision,
     secondary_front_margin_min_m double precision,
@@ -375,3 +405,39 @@ ALTER TABLE silver.zoning_grid_columns
     ADD COLUMN IF NOT EXISTS piia_sector       text,
     ADD COLUMN IF NOT EXISTS pae               text,
     ADD COLUMN IF NOT EXISTS specific_articles text;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the two norms Quebec City's grid states and Montreal's does not
+-- ---------------------------------------------------------------------------
+--
+-- *Normes de densité* on a Quebec City grid holds two things this schema had
+-- no column for, and both were being dropped on the way in:
+--
+--   * dwelling_density_{min,max}_per_ha - *Nb de log. à l'hectare*. Carried
+--     apart from density_min/density_max because those are a floor-area ratio
+--     and this is a unit count per hectare; folding one into the other would
+--     have multiplied a dwelling count by a lot area and called it floor area.
+--     2 592 of the city's zones state the minimum and 985 the maximum.
+--   * commercial_floor_max_m2 - *Superficie maximale de plancher* for the
+--     commerce family, per building: the tighter of the grid's *Vente au
+--     détail* and *Administration* ceilings, which differ on 2 845 zones.
+--
+-- Repeated here as ALTERs for the reason the rear_on_street_margin_min_m block
+-- above gives: CREATE TABLE IF NOT EXISTS leaves an existing table as it found
+-- it, so a column added to the body of one reaches a fresh database only, and
+-- on hbu-dev the failure surfaces as `column ... of relation
+-- silver_..._load does not exist`.
+--
+-- A column added ahead of the data is NULL, not wrong. Every row written
+-- before this is NULL here and nothing backfills it: re-materialize the
+-- partition's zoning_grid_columns and lot_zoning_envelopes to fill them, and
+-- re-solve lot_development_programs, since the solver now reads all three.
+ALTER TABLE silver.zoning_grid_columns
+    ADD COLUMN IF NOT EXISTS dwelling_density_min_per_ha double precision,
+    ADD COLUMN IF NOT EXISTS dwelling_density_max_per_ha double precision,
+    ADD COLUMN IF NOT EXISTS commercial_floor_max_m2     double precision;
+
+ALTER TABLE silver.lot_zoning_envelopes
+    ADD COLUMN IF NOT EXISTS dwelling_density_min_per_ha double precision,
+    ADD COLUMN IF NOT EXISTS dwelling_density_max_per_ha double precision,
+    ADD COLUMN IF NOT EXISTS commercial_floor_max_m2     double precision;

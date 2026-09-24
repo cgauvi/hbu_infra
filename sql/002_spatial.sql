@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS rag.features (
     -- Matches the ids the dataplatform writes into rag.chunks.feature_ids.
     feature_id   text NOT NULL,
     source_table text NOT NULL,
+    -- The unit the *publisher* files the layer under: Montreal's Spectrum
+    -- namespace (`19_VSMPE`), the city for Quebec and Saguenay, which publish
+    -- one zoning layer each and no namespace at all. `source_table` is the
+    -- file slug and drops it, which is why C01-001 in one borough and
+    -- C01-001 in the next need something else to tell them apart. See
+    -- 027_features_source_namespace.sql and the dataplatform's
+    -- `urban_rag.partitions.source_namespace_for`.
+    source_namespace text NOT NULL DEFAULT '',
     neighborhood text NOT NULL,
     scrape_date  date NOT NULL,
     attributes   jsonb NOT NULL DEFAULT '{}'::jsonb,
