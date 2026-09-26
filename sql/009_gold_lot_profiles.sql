@@ -1,5 +1,5 @@
--- gold.lot_profiles — every lot in a borough, with what stands on it, what it
--- faces, and what governs it. One row per cadastral parcel.
+-- gold.lot_profiles — every lot in a cut cell, with what stands on it, what
+-- it faces, and what governs it. One row per cadastral parcel.
 --
 -- The gold table of the lot lineage, and the one a highest-and-best-use
 -- question is read out of. It replaces an earlier `rag.vacant_lots`, which
@@ -15,7 +15,7 @@
 -- same rows. That is why this file exists and 009_vacant_lots.sql never did.
 --
 -- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_profiles) once
--- that borough's silver.building_lot_intersections, silver.lot_frontage and
+-- the cell's silver.building_lot_intersections, silver.lot_frontage and
 -- silver.lot_features rows have landed — see its README. Three joins collapse
 -- into this one table, each from one row per (lot × something) down to one row
 -- per lot:
@@ -41,7 +41,7 @@
 --                                       assessed_to_estimated_ratio, comparables
 --
 -- That one says what the property standing on the lot *earns* on what it is
--- assessed at, and what the k most similar lots in the borough imply the ground
+-- assessed at, and what the k most similar lots around it imply the ground
 -- is actually worth. Also a plain LEFT JOIN, and also on lot_number, for the
 -- reasons the fourth is. See sql/016.
 --
@@ -67,8 +67,10 @@
 --   bronze/montreal_*_costs            → construction_costs, and the six rate
 --                                        columns flattened out of it
 --
--- The last three are figures repeated on every lot of a partition — the CMHC
--- pair is the borough's, the cost guide's is the whole city's. That is
+-- The last three are figures repeated on every lot of a borough — the CMHC
+-- pair is the borough's, read per lot by the lot's own borough, so a cell
+-- astride a borough line prices each lot by its own survey; the cost guide's
+-- is the whole city's. That is
 -- deliberate: it is what let silver/lots_with_vacancy_rates go, an asset whose
 -- whole job was pivoting the CMHC grid onto the cadastre one layer earlier —
 -- where it rode through rag.lots.attributes and every spatial join downstream
@@ -84,13 +86,13 @@
 -- ---------------------------------------------------------------------------
 --
 -- `lot_profiles` is a gold asset, so its table is in `gold` and partitioned by
--- neighborhood and scrape date like every other one — see 003_warehouse.sql.
--- The surrogate `lot_profile_uid` is gone with the move (a partitioned table's
--- primary key must contain the partition keys, and no reader ever cited it),
--- and the grain the old UNIQUE (lot_uid) declared is now stated in the column
--- that survives a reload:
+-- cut cell and scrape date like the rest of the lot chain — see
+-- 003_warehouse.sql. The surrogate `lot_profile_uid` is gone with the move (a
+-- partitioned table's primary key must contain the partition keys, and no
+-- reader ever cited it), and the grain the old UNIQUE (lot_uid) declared is
+-- now stated in the column that survives a reload:
 --
---     PRIMARY KEY (scrape_date, neighborhood, lot_number)
+--     PRIMARY KEY (scrape_date, cell_partition, lot_number)
 --
 -- which is what the pipeline's upsert conflicts on. `lot_uid` stays as a plain
 -- column: it is the bigserial rag.lots mints, useful for joining back to the
@@ -104,9 +106,76 @@
 
 SET search_path TO gold, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('gold.lot_profiles');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I', target, 'lot_profiles_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'gold.lot_profiles was LIST (neighborhood): renamed to '
+        'gold.lot_profiles_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS gold.lot_profiles (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
     scrape_date      date NOT NULL,
+    cell_key         text COLLATE "C" NOT NULL,
+    cell_partition   text COLLATE "C" NOT NULL,
     neighborhood     text NOT NULL,
     -- Infolot's own lot number, and the key of this table: rag.lots.lot_uid is
     -- a bigserial a reload mints again, and the number is what survives one.
@@ -294,8 +363,10 @@ CREATE TABLE IF NOT EXISTS gold.lot_profiles (
     -- -- what the rental market around it looks like -----------------------
     --
     -- CMHC surveys neighborhoods, not parcels, so these two are the
-    -- *borough's* figures and are identical on every lot of a (neighborhood,
-    -- scrape_date). They are here rather than in a table of their own because
+    -- *borough's* figures and are identical on every lot of one borough and
+    -- one scrape_date — each lot's own borough, so a cell astride a borough
+    -- line carries both surveys. They are here rather than in a table of
+    -- their own because
     -- the question this one is read for — what is this parcel worth building —
     -- is asked one lot at a time and answered against the market the lot sits
     -- in. Denormalising a dozen survey cells onto every row is the same trade
@@ -366,11 +437,11 @@ CREATE TABLE IF NOT EXISTS gold.lot_profiles (
 
     geom             geometry(MultiPolygon, 4326),
     loaded_at        timestamptz NOT NULL DEFAULT now(),
-    -- One profile per lot per borough-day. rag.lots already scopes a lot
-    -- number to a single (borough, scrape_date), so this is the grain the
-    -- table declares and the conflict target the upsert names.
-    PRIMARY KEY (scrape_date, neighborhood, lot_number)
-) PARTITION BY LIST (neighborhood);
+    -- One profile per lot per cell-day. rag.lots already scopes a lot number
+    -- to a single scrape_date and a lot to a single cell, so this is the grain
+    -- the table declares and the conflict target the upsert names.
+    PRIMARY KEY (scrape_date, cell_partition, lot_number)
+) PARTITION BY LIST (cell_partition);
 
 -- ---------------------------------------------------------------------------
 -- Widening an existing table
@@ -491,7 +562,10 @@ ALTER TABLE gold.lot_profiles
 
 -- Created on the parent, so every partition warehouse.ensure_partition adds
 -- gets them without anyone remembering to. The (neighborhood, scrape_date)
--- index the old table needed is gone: that filter is now partition pruning.
+-- index the old table needed is back: the map reads a borough at a time, and
+-- the borough is an attribute again now that the cell is the partition.
+CREATE INDEX IF NOT EXISTS lot_profiles_neighborhood_idx
+    ON gold.lot_profiles (neighborhood, scrape_date);
 CREATE INDEX IF NOT EXISTS lot_profiles_geom_idx
     ON gold.lot_profiles USING gist (geom);
 CREATE INDEX IF NOT EXISTS lot_profiles_number_idx

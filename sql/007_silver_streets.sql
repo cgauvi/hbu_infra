@@ -1,5 +1,5 @@
--- silver.neighborhood_streets — the roadway centre lines, from the RQTT, cut
--- to one borough.
+-- silver.neighborhood_streets — the roadway centre lines, from the RQTT, one
+-- cut cell's worth at a time.
 --
 -- The RQTT (Référentiel québécois du transport terrestre) is the MRNF's
 -- province-wide road network, and it replaced three municipal layers at once:
@@ -18,13 +18,19 @@
 --
 -- Filled by hbu_dataplatform's `neighborhood_streets` asset from its own
 -- silver/neighborhood_streets partitions: the MRNF publishes the layer for the
--- province, and the pipeline cuts it to a borough before loading, so the rows
--- here are already clipped to the (neighborhood, scrape_date) they carry.
+-- province, and the pipeline takes the segments whose midpoint falls in the
+-- cut cell it is running for, whole. Nothing is clipped — a segment belongs
+-- to exactly one cell by its midpoint and is stored entire, so a lot on a
+-- cell edge measures its frontage against the whole side and not against the
+-- half that happened to fall on its side of a line. It used to be cut to the
+-- borough, which is what the name still says; `neighborhood` is now the
+-- borough outline the midpoint falls in, and NULL where no loaded borough
+-- contains it, since a side can sit on ground no publisher's outline claims.
 --
 -- `cote_rue_id` is the publisher's own key for a segment — the RQTT's
 -- `AQRP_UUID`, which is one per segment across the province, and not `IdRte`,
 -- which carries both nulls and duplicates. That uniqueness makes it the
--- natural key this table's upsert conflicts on — one segment, one borough, one
+-- natural key this table's upsert conflicts on — one segment, one cell, one
 -- day, one row.
 --
 -- The *name* `cote_rue_id` is a côté de rue, a side of street, and nothing
@@ -55,9 +61,80 @@
 
 SET search_path TO silver, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.neighborhood_streets');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'neighborhood_streets_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.neighborhood_streets was LIST (neighborhood): renamed to '
+        'silver.neighborhood_streets_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.neighborhood_streets (
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains. The
+    -- cell columns are the side's own, taken at its midpoint (028_cell_key.sql
+    -- for the address): a side belongs to the cell its midpoint is in. The
+    -- borough is the outline containing that midpoint, and nullable — see the
+    -- header — which is the one place in the lot chain it is.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text,
     -- The publisher's AQRP_UUID, under this platform's COTE_RUE_ID.
     cote_rue_id  text NOT NULL,
     -- NomRte, under this platform's NOM_VOIE. Nullable: 231 of the Montreal
@@ -66,17 +143,23 @@ CREATE TABLE IF NOT EXISTS silver.neighborhood_streets (
     length_m     double precision,
     attributes   jsonb NOT NULL DEFAULT '{}'::jsonb,
     -- EPSG:4326, matching every other geometry here. MultiLineString because
-    -- the source publishes MultiLineString and because clipping a side at a
-    -- borough line can split it into two.
+    -- the source publishes MultiLineString; nothing here splits a side any
+    -- more, now that no borough line clips it.
     geom         geometry(MultiLineString, 4326),
     loaded_at    timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, cote_rue_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, cote_rue_id)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS neighborhood_streets_geom_idx
     ON silver.neighborhood_streets USING gist (geom);
 CREATE INDEX IF NOT EXISTS neighborhood_streets_name_idx
     ON silver.neighborhood_streets (street_name);
+-- The map's per-borough read, which used to be partition pruning. The NULLs
+-- — sides no loaded borough contains — are not in it, which is the right
+-- answer to "this borough's streets".
+CREATE INDEX IF NOT EXISTS neighborhood_streets_neighborhood_idx
+    ON silver.neighborhood_streets (neighborhood, scrape_date)
+    WHERE neighborhood IS NOT NULL;
 
 DO $$
 DECLARE

@@ -1,38 +1,49 @@
 -- Partition maintenance for the silver and gold tables.
 --
 -- Every table in `silver` and `gold` is declaratively partitioned the same
--- way, because every one of them holds the same thing: one borough's snapshot
--- of one day.
+-- way, because every one of them holds the same thing: one partition's
+-- snapshot of one month.
 --
---     <table>                          PARTITION BY LIST  (neighborhood)
+--     <table>                          PARTITION BY LIST  (<spatial column>)
 --       <table>__vsmpe                 PARTITION BY RANGE (scrape_date)
 --         <table>__vsmpe__202608       one month of it
 --
+-- Which spatial column leads is the table's *axis*, and there are two. The
+-- lot chain - every table whose rows have a lot, a street side or an address
+-- point to be placed by - is `LIST (cell_partition)`: a cell of the tile cut,
+-- a quadkey such as `0302303330102`, ground that cannot be redrawn and holds
+-- about one run's worth of lots wherever it is. What a *publisher* bounds -
+-- the CMHC and C&W tables, the zoning grid, the roll, the corpus - is
+-- `LIST (neighborhood)`, the borough it was published for. The dataplatform's
+-- `urban_rag.warehouse.Axis` names which is which; the functions here do not
+-- care, because a LIST child is created against whatever the parent is
+-- partitioned by.
+--
 -- Two levels rather than one, and in that order, because the two axes are not
--- the same kind of axis. The borough set is small, closed and named — 17 of
--- them, listed in the dataplatform's `urban_rag.partitions` — so LIST says
--- exactly what it means and a borough's whole history is one subtree an
--- operator can detach or drop. The date axis is open and grows a row every
--- day, so it is RANGE, by month: daily partitions would be ~6 000 tables a
--- year across these tables and buy nothing, since nothing here is ever queried
--- for a single day across all boroughs.
+-- the same kind of axis. The spatial set is small, closed and named - a few
+-- dozen cells, listed in the dataplatform's `urban_rag.tile_cut`, or the
+-- boroughs in `urban_rag.partitions` - so LIST says exactly what it means and
+-- a partition's whole history is one subtree an operator can detach or drop.
+-- The date axis is open and grows a row every day, so it is RANGE, by month:
+-- daily partitions would be ~6 000 tables a year across these tables and buy
+-- nothing, since nothing here is ever queried for a single day everywhere.
 --
 -- What this gets a reader is partition pruning on the filter every one of them
--- writes anyway. `WHERE neighborhood = 'VSMPE' AND scrape_date = '2026-08-26'`
--- touches one leaf; without partitioning it is an index scan over every
--- borough-day the table has ever held.
+-- writes anyway. `WHERE cell_partition = '0302303330102' AND scrape_date =
+-- '2026-08-26'` touches one leaf; without partitioning it is an index scan
+-- over every partition-month the table has ever held.
 --
 -- What it costs the *writer* is the rule this whole design turns on:
 --
 --     a partitioned table's unique constraint must contain its partition keys.
 --
--- So the primary key of every table here is (scrape_date, neighborhood, <the
--- natural key>) — which is not a concession, it is the grain restated, and it
--- is exactly what the dataplatform's upsert conflicts on:
+-- So the primary key of every table here is (scrape_date, <spatial column>,
+-- <the natural key>) — which is not a concession, it is the grain restated,
+-- and it is exactly what the dataplatform's upsert conflicts on:
 --
---     INSERT INTO silver.neighborhood_streets (...)
+--     INSERT INTO silver.lot_frontage (...)
 --     VALUES (...)
---     ON CONFLICT (scrape_date, neighborhood, cote_rue_id)
+--     ON CONFLICT (scrape_date, cell_partition, lot_uid, cote_rue_id)
 --     DO UPDATE SET ...
 --
 -- See hbu_dataplatform's `urban_rag.warehouse`, which is the only writer.
@@ -49,10 +60,10 @@
 -- nobody declared is a table that has to be rewritten to repair.
 --
 -- `warehouse.ensure_partition` is the third option. The pipeline calls it with
--- the (neighborhood, scrape_date) it is about to write, before it writes, and
--- it is two catalog lookups when the leaf already exists. A borough enabled
--- for the first time and the first load of a new month both just work; nothing
--- lands anywhere it cannot be moved out of.
+-- the (partition, scrape_date) it is about to write, before it writes, and
+-- it is two catalog lookups when the leaf already exists. A borough or a cell
+-- written for the first time and the first load of a new month both just
+-- work; nothing lands anywhere it cannot be moved out of.
 --
 -- Owned by the pipeline's role, which is what makes this work at all: it owns
 -- the silver and gold schemas, so the partitions it creates through here are
@@ -65,13 +76,14 @@ SET search_path TO warehouse, public;
 --
 -- Two underscores between the parts, so `neighborhood_streets` + `VSMPE` reads
 -- as one table and one borough rather than as an ambiguous run of words. The
--- borough is lowercased and anything outside [a-z0-9_] folded to `_`, since
--- these become identifiers and the borough keys are free text as far as this
--- database is concerned.
+-- partition value is lowercased and anything outside [a-z0-9_] folded to `_`,
+-- since these become identifiers and the borough keys are free text as far as
+-- this database is concerned. A cut cell is digits 0-3 and passes untouched.
 --
 -- Truncated to 63 bytes because that is what an identifier is; the leading
 -- part is the table name, which is the half worth keeping when a name is too
--- long to hold both.
+-- long to hold both. Nothing here reaches it: the longest table name plus a
+-- 14-digit cell plus a month is 52.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION warehouse.partition_name(base text, suffix text)
@@ -82,17 +94,27 @@ AS $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Create the leaf this (neighborhood, scrape_date) belongs in, if it is new
+-- Create the leaf this (partition, scrape_date) belongs in, if it is new
 --
--- Returns the leaf's qualified name, so a caller that wants to log or COPY
--- straight into it can. Idempotent, and safe to call from two runs at once:
--- the `IF ... IS NULL` is the cheap path and the exception block is what
--- covers the race between checking and creating.
+-- `in_partition` is the LIST value - a borough key or a cut cell, whichever
+-- the parent is partitioned on; this function never looks at the column's
+-- name. Returns the leaf's qualified name, so a caller that wants to log or
+-- COPY straight into it can. Idempotent, and safe to call from two runs at
+-- once: the `IF ... IS NULL` is the cheap path and the exception block is
+-- what covers the race between checking and creating.
+--
+-- Dropped before it is created because the parameter was renamed from
+-- `in_neighborhood`, and `CREATE OR REPLACE` refuses to rename a parameter -
+-- it would abort `db init` on every database created before the tile axis.
+-- Nothing depends on the function (it is only called), and the ownership and
+-- the REVOKE below are re-applied on every run, so the drop costs nothing.
 -- ---------------------------------------------------------------------------
+
+DROP FUNCTION IF EXISTS warehouse.ensure_partition(regclass, text, date);
 
 CREATE OR REPLACE FUNCTION warehouse.ensure_partition(
     parent          regclass,
-    in_neighborhood text,
+    in_partition    text,
     in_scrape_date  date
 )
 RETURNS text
@@ -101,15 +123,15 @@ AS $$
 DECLARE
     parent_schema text;
     parent_name   text;
-    borough_part  text;
+    list_part     text;
     month_part    text;
     month_start   date := date_trunc('month', in_scrape_date)::date;
     month_end     date := (date_trunc('month', in_scrape_date) + interval '1 month')::date;
 BEGIN
-    IF in_neighborhood IS NULL OR in_scrape_date IS NULL THEN
+    IF in_partition IS NULL OR in_scrape_date IS NULL THEN
         RAISE EXCEPTION
-            'ensure_partition(%): neighborhood and scrape_date are the partition '
-            'key and neither may be NULL', parent;
+            'ensure_partition(%): the partition value and scrape_date are the '
+            'partition key and neither may be NULL', parent;
     END IF;
 
     SELECT n.nspname, c.relname
@@ -118,16 +140,16 @@ BEGIN
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.oid = parent;
 
-    borough_part := warehouse.partition_name(parent_name, in_neighborhood);
-    month_part   := warehouse.partition_name(borough_part, to_char(month_start, 'YYYYMM'));
+    list_part  := warehouse.partition_name(parent_name, in_partition);
+    month_part := warehouse.partition_name(list_part, to_char(month_start, 'YYYYMM'));
 
-    -- 1. The borough, itself partitioned by date.
-    IF to_regclass(format('%I.%I', parent_schema, borough_part)) IS NULL THEN
+    -- 1. The LIST child - a borough or a cell - itself partitioned by date.
+    IF to_regclass(format('%I.%I', parent_schema, list_part)) IS NULL THEN
         BEGIN
             EXECUTE format(
                 'CREATE TABLE %I.%I PARTITION OF %I.%I '
                 'FOR VALUES IN (%L) PARTITION BY RANGE (scrape_date)',
-                parent_schema, borough_part, parent_schema, parent_name, in_neighborhood
+                parent_schema, list_part, parent_schema, parent_name, in_partition
             );
         EXCEPTION
             -- Another session created it between the check and the CREATE.
@@ -142,7 +164,7 @@ BEGIN
         BEGIN
             EXECUTE format(
                 'CREATE TABLE %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-                parent_schema, month_part, parent_schema, borough_part,
+                parent_schema, month_part, parent_schema, list_part,
                 month_start, month_end
             );
         EXCEPTION
@@ -157,10 +179,10 @@ $$;
 -- ---------------------------------------------------------------------------
 -- What is actually in there
 --
--- One row per leaf: which table, which borough, which month, how big. The
+-- One row per leaf: which table, which partition, which month, how big. The
 -- read `db.py check` prints and the one to run before detaching anything.
--- Leaves only — the borough level is a container and has no storage of its
--- own, so counting it would double every number.
+-- Leaves only — the LIST level is a container and has no storage of its own,
+-- so counting it would double every number.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW warehouse.partitions AS
@@ -172,8 +194,8 @@ CREATE OR REPLACE VIEW warehouse.partitions AS
            pg_total_relation_size(leaf.oid)        AS bytes
       FROM pg_class leaf
       JOIN pg_inherits child   ON child.inhrelid = leaf.oid
-      JOIN pg_class borough    ON borough.oid = child.inhparent
-      JOIN pg_inherits gparent ON gparent.inhrelid = borough.oid
+      JOIN pg_class list_child ON list_child.oid = child.inhparent
+      JOIN pg_inherits gparent ON gparent.inhrelid = list_child.oid
       JOIN pg_class parent     ON parent.oid = gparent.inhparent
       LEFT JOIN pg_stat_user_tables stat ON stat.relid = leaf.oid
      WHERE parent.relnamespace::regnamespace::text IN ('silver', 'gold')

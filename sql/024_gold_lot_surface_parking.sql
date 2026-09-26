@@ -114,9 +114,78 @@
 
 SET search_path TO gold, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('gold.lot_surface_parking');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_surface_parking_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'gold.lot_surface_parking was LIST (neighborhood): renamed to '
+        'gold.lot_surface_parking_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS gold.lot_surface_parking (
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- The same key as gold.lot_building_massing, so the building and its
     -- parking join on one column.
     lot_uid      bigint NOT NULL,
@@ -190,8 +259,8 @@ CREATE TABLE IF NOT EXISTS gold.lot_surface_parking (
     -- The zone is in the key: one row per piece of ground, following
     -- gold.lot_highest_best_use. See sql/018's header for why a parcel is
     -- not always one site.
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id)
+) PARTITION BY LIST (cell_partition);
 
 -- The map read: "every surface parking lot in this bounding box". The reason
 -- this table is spatial at all.
@@ -203,10 +272,13 @@ CREATE INDEX IF NOT EXISTS lot_surface_parking_geom_idx
 CREATE INDEX IF NOT EXISTS lot_surface_parking_fit_idx
     ON gold.lot_surface_parking (surface_parking_fit_pct)
     WHERE parking_status = 'shrunk';
--- "The most asphalt this borough would lay" — the list to draw first, and the
+-- "The most asphalt this cell would lay" — the list to draw first, and the
 -- one to argue about.
 CREATE INDEX IF NOT EXISTS lot_surface_parking_area_idx
     ON gold.lot_surface_parking (placed_surface_parking_m2 DESC);
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_surface_parking_neighborhood_idx
+    ON gold.lot_surface_parking (neighborhood, scrape_date);
 
 DO $$
 DECLARE

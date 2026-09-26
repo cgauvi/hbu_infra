@@ -1,5 +1,5 @@
--- silver.lot_assessment_comparables — what every lot in a borough yields, and
--- which lots the roll says are like it.
+-- silver.lot_assessment_comparables — what every lot in a cut cell yields,
+-- and which lots the roll says are like it.
 --
 -- The same grain and the same key as silver.lot_assessed_values (sql/013),
 -- because it is the same lot. That table sums one column of Quebec's rôle
@@ -105,11 +105,12 @@
 -- built ones around it, through `value_per_land_m2_cad` and the ground area of
 -- its own polygon.
 --
--- **The pool is this borough.** sql/013 is partitioned by borough, so the
--- valued lots available as comparables are the ones in the same partition and a
--- parcel on the boundary draws its neighbours from its own side of it. A
--- limitation of how the upstream is partitioned rather than a modelling choice;
--- the asset reports `num_candidates` per run so a thin pool is visible.
+-- **The pool is the snapshot, within reach.** The candidates are every valued
+-- lot of sql/013 on the same scrape_date inside the cell's envelope widened by
+-- the search radius — the one bound that cannot change the answer — so a
+-- parcel on a cell edge, or on a borough line, draws its neighbours from both
+-- sides of it. It used to be the borough, because that was the partition; the
+-- asset still reports `num_candidates` per run so a thin pool is visible.
 --
 -- `estimated_value_cad` is the median comparable ratio applied back to this
 -- lot, and `estimated_value_basis` names which ratio — 'per_dwelling' where the
@@ -153,10 +154,78 @@
 
 SET search_path TO silver, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_assessment_comparables');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_assessment_comparables_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_assessment_comparables was LIST (neighborhood): renamed to '
+        'silver.lot_assessment_comparables_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_assessment_comparables (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too — whose CMHC and C&W rows priced it, and what the map reads by.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- NO_LOT in the published cadastre, and the same key sql/013 conflicts on.
     lot_number   text NOT NULL,
     -- The polygon's own area, in EPSG:32188 metres. See the header for why this
@@ -299,10 +368,10 @@ CREATE TABLE IF NOT EXISTS silver.lot_assessment_comparables (
     -- type would reject exactly the rows that needed repairing.
     geom        geometry(Geometry, 4326),
     loaded_at   timestamptz NOT NULL DEFAULT now(),
-    -- One row per lot per borough-day, the grain sql/013 declares and the
+    -- One row per lot per cell-day, the grain sql/013 declares and the
     -- conflict target the upsert names.
-    PRIMARY KEY (scrape_date, neighborhood, lot_number)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_number)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS lot_assessment_comparables_geom_idx
     ON silver.lot_assessment_comparables USING gist (geom);
@@ -324,6 +393,9 @@ CREATE INDEX IF NOT EXISTS lot_assessment_comparables_ratio_idx
 -- serve. The same index silver.assessment_units carries on its own use code.
 CREATE INDEX IF NOT EXISTS lot_assessment_comparables_use_idx
     ON silver.lot_assessment_comparables (dominant_use_code);
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_assessment_comparables_neighborhood_idx
+    ON silver.lot_assessment_comparables (neighborhood, scrape_date);
 
 DO $$
 DECLARE

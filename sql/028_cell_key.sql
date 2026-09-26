@@ -39,20 +39,26 @@
 -- given geometry, which is the other half of what a permanent address needs.
 --
 -- ---------------------------------------------------------------------------
--- What this file does NOT do
+-- `cell_partition`, and who writes it
 -- ---------------------------------------------------------------------------
 --
--- `cell_partition` is added beside it and left NULL. It is a *prefix* of
--- cell_key, and how long a prefix depends on the cut - the variable-depth set
--- of cells the pipeline partitions on - which is a checked-in constant in the
--- dataplatform (`urban_rag.tile_cut`) and is not seeded yet. Nothing
--- repartitions here: every table is still PARTITION BY LIST (neighborhood),
--- and these two columns are nullable, non-key, and read by nothing.
+-- `cell_partition` is the *prefix* of cell_key that names the cut cell owning
+-- the row - how long a prefix depends on the cut, the variable-depth set of
+-- cells the lot chain is partitioned on, which is a checked-in constant in
+-- the dataplatform (`urban_rag.tile_cut`). `warehouse.tile_of` below resolves
+-- a key against a cut handed in as an array; the dataplatform's loaders call
+-- it with the live cut on every INSERT, so both columns are written on the
+-- way in and a reload never leaves them NULL.
 --
--- The silver and gold tables do not get these columns here either. Their rows
--- inherit the lot's address rather than deriving their own, so the column
--- lands with the repartition that needs it rather than sitting NULL on twenty
--- tables in the meantime.
+-- This file backfills `cell_key` only. `cell_partition` needs the cut, which
+-- lives in Python, so a row loaded before the loaders wrote it gets its
+-- partition from the next `neighborhood_cadastre` run of its borough - not
+-- from `db init`. The count of rows that have a key and no partition is the
+-- number to read before trusting a tile run.
+--
+-- The silver and gold tables of the lot chain carry both columns as well -
+-- see each table's own file - inheriting the lot's address rather than
+-- deriving their own, and they are partitioned on `cell_partition`.
 
 SET search_path TO warehouse, public;
 
@@ -109,22 +115,55 @@ COMMENT ON FUNCTION warehouse.quadkey(double precision, double precision, intege
 
 
 -- ---------------------------------------------------------------------------
--- The column, on the three tables that derive it from their own geometry
+-- The cut cell that owns a key
 --
--- `rag.lots`, `rag.buildings` and `rag.features` are plain tables, not
--- partitioned ones, so this is an ADD COLUMN and an index rather than a
--- migration. Everything downstream of them is lot-keyed and inherits the lot's
--- address.
+-- A prefix walk over the cut handed in: the member that prefixes the key is
+-- the cell, and because no member of a valid cut nests inside another there
+-- is at most one. NULL for ground the cut does not cover, which the loaders
+-- turn into a failure rather than a row nobody will compute over.
+--
+-- The cut is a parameter rather than a table because it is a checked-in
+-- constant on the dataplatform side (`urban_rag.tile_cut.CUT`) and the one
+-- copy that exists should be the one that is passed in - a second copy here
+-- would be the one that goes stale.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION warehouse.tile_of(cell_key text, cut text[])
+RETURNS text
+LANGUAGE sql
+IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT cell
+      FROM unnest(cut) AS cell
+     WHERE left(cell_key, length(cell)) = cell
+     ORDER BY length(cell) DESC
+     LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION warehouse.tile_of(text, text[]) IS
+    'The member of cut that prefixes cell_key, or NULL for ground the cut does '
+    'not cover. Mirrors urban_rag.tile_cut.cell_partition_of.';
+
+
+-- ---------------------------------------------------------------------------
+-- The columns, on the four tables that derive them from their own geometry
+--
+-- `rag.lots`, `rag.buildings`, `rag.features` and `rag.addresses` are plain
+-- tables, not partitioned ones, so this is an ADD COLUMN and an index rather
+-- than a migration. Everything downstream of the lots is lot-keyed and
+-- inherits the lot's address; the addresses are points and own theirs.
 -- ---------------------------------------------------------------------------
 
 DO $$
 DECLARE
     target text;
 BEGIN
-    FOREACH target IN ARRAY ARRAY['rag.lots', 'rag.buildings', 'rag.features']
+    FOREACH target IN ARRAY ARRAY[
+        'rag.lots', 'rag.buildings', 'rag.features', 'rag.addresses'
+    ]
     LOOP
         IF to_regclass(target) IS NULL THEN
-            RAISE NOTICE '% does not exist - apply 002_spatial.sql first', target;
+            RAISE NOTICE '% does not exist - apply 002_spatial.sql (or 026 for the addresses) first', target;
             CONTINUE;
         END IF;
 
@@ -165,6 +204,17 @@ CREATE INDEX IF NOT EXISTS buildings_cell_key_idx
     ON rag.buildings (cell_key) WHERE cell_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS features_cell_key_idx
     ON rag.features (cell_key) WHERE cell_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS addresses_cell_key_idx
+    ON rag.addresses (cell_key) WHERE cell_key IS NOT NULL;
+
+-- The read every tile run opens with - "the lots this cell owns, this
+-- month" - and the one `tiles_of_neighborhood` makes the other way round.
+CREATE INDEX IF NOT EXISTS lots_cell_partition_idx
+    ON rag.lots (cell_partition, scrape_date) WHERE cell_partition IS NOT NULL;
+CREATE INDEX IF NOT EXISTS buildings_cell_partition_idx
+    ON rag.buildings (cell_partition, scrape_date) WHERE cell_partition IS NOT NULL;
+CREATE INDEX IF NOT EXISTS addresses_cell_partition_idx
+    ON rag.addresses (cell_partition, scrape_date) WHERE cell_partition IS NOT NULL;
 
 
 -- ---------------------------------------------------------------------------
@@ -202,6 +252,12 @@ UPDATE rag.features
    SET cell_key = warehouse.quadkey(
            ST_X(ST_PointOnSurface(geom)), ST_Y(ST_PointOnSurface(geom)), 19
        )
+ WHERE cell_key IS NULL
+   AND geom IS NOT NULL
+   AND NOT ST_IsEmpty(geom);
+
+UPDATE rag.addresses
+   SET cell_key = warehouse.quadkey(ST_X(geom), ST_Y(geom), 19)
  WHERE cell_key IS NULL
    AND geom IS NOT NULL
    AND NOT ST_IsEmpty(geom);

@@ -66,12 +66,30 @@ SET search_path TO rag, public;
 -- something ever does, failing loudly here beats dropping it silently.
 DROP VIEW IF EXISTS rag.lot_documents;
 
+-- The document is matched on the *feature's* namespace, not on the lot's
+-- borough. Since the lot chain moved to the cut cell, silver.lot_features
+-- pairs a lot with every zone that covers it, whichever borough filed the
+-- zone, and `lf.neighborhood` is the lot's borough — the wrong key for a zone
+-- the borough next door published. The feature's namespace is on rag.features
+-- (through `feature_uid`); a chunk carries only the borough its corpus was
+-- indexed under, and that borough's namespace is read off the features it
+-- filed — the bridge 003_spatial_search.sql's rag.chunk_features uses.
+-- Collapsing the documents to the namespace also keeps one row per (lot,
+-- document) where a namespace spans several boroughs' corpora.
 CREATE VIEW rag.lot_documents AS
-    WITH documents AS (
+    WITH namespaces AS (
+        SELECT DISTINCT neighborhood, scrape_date, source_table, source_namespace
+          FROM rag.features
+    ),
+    documents AS (
         SELECT DISTINCT
-               doc_id, url, title, source_table, neighborhood,
-               scrape_date, feature_ids
-          FROM rag.chunks
+               c.doc_id, c.url, c.title, c.source_table, ns.source_namespace,
+               c.scrape_date, c.feature_ids
+          FROM rag.chunks c
+          JOIN namespaces ns
+            ON ns.neighborhood = c.neighborhood
+           AND ns.scrape_date = c.scrape_date
+           AND ns.source_table = c.source_table
     )
     SELECT lf.lot_uid,
            l.lot_number,
@@ -90,12 +108,13 @@ CREATE VIEW rag.lot_documents AS
            d.title
       FROM silver.lot_features lf
       JOIN rag.lots l USING (lot_uid)
+      JOIN rag.features f ON f.feature_uid = lf.feature_uid
       JOIN documents d
         ON d.source_table = lf.source_table
-       -- The borough belongs in the join, not just the partition filter: the
-       -- slug in `source_table` carries no namespace, so C01-001 exists in
-       -- every borough that publishes a VSP_REG_ZONE.
-       AND d.neighborhood = lf.neighborhood
+       -- The namespace belongs in the join: the slug in `source_table`
+       -- carries none, so C01-001 exists in every borough that publishes a
+       -- VSP_REG_ZONE.
+       AND d.source_namespace = f.source_namespace
        AND d.scrape_date = lf.scrape_date
        AND d.feature_ids ? lf.feature_id;
 
@@ -170,11 +189,14 @@ AS $$
          ORDER BY l.scrape_date DESC
          LIMIT 1
     ),
+    -- The feature's namespace rather than the lot's borough, for the reason
+    -- rag.lot_documents above gives.
     applies AS (
         SELECT lf.feature_id, lf.source_table, lf.pct_of_lot,
-               lf.neighborhood, lf.scrape_date, lot.lot_number
+               f.source_namespace, lf.scrape_date, lot.lot_number
           FROM lot
           JOIN silver.lot_features lf USING (lot_uid)
+          JOIN rag.features f ON f.feature_uid = lf.feature_uid
          WHERE lf.pct_of_lot >= min_pct_of_lot
            AND lf.overlap_area_m2 >= min_overlap_m2
            AND (on_source_table IS NULL OR lf.source_table = on_source_table)
@@ -192,9 +214,16 @@ AS $$
       FROM applies a
       JOIN rag.chunks c
         ON c.source_table = a.source_table
-       AND c.neighborhood = a.neighborhood
        AND c.scrape_date = a.scrape_date
        AND c.feature_ids ? a.feature_id
+       AND EXISTS (
+           SELECT 1
+             FROM rag.features ns
+            WHERE ns.source_table = c.source_table
+              AND ns.source_namespace = a.source_namespace
+              AND ns.scrape_date = c.scrape_date
+              AND ns.neighborhood = c.neighborhood
+       )
      ORDER BY c.embedding <=> query_embedding
      LIMIT match_count;
 $$;

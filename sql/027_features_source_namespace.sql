@@ -31,13 +31,15 @@
 -- What this file does NOT do
 -- ---------------------------------------------------------------------------
 --
--- It does not touch `features_identity_key`. The constraint stays on
--- `neighborhood` until the partition key actually moves, because the two are
--- 1:1 today and swapping them now would be a behaviour change dressed as a
--- rename — on Quebec City it would collapse six arrondissements into one
--- namespace, and the second arrondissement loaded would lose any zone the
--- first had already landed. The swap belongs with the repartition, where its
--- effect can be tested against a partition-sum invariant rather than assumed.
+-- It does not touch `features_identity_key`. When this file was written the
+-- constraint stayed on `neighborhood`, because the two were 1:1 and the swap
+-- belonged with the repartition. The repartition has happened (2026-09-24):
+-- 005_silver_lot_features.sql, which runs before this file, now moves the key
+-- onto (source_table, feature_id, source_namespace, scrape_date) — on Quebec
+-- City that collapses six arrondissements into one namespace, which is the
+-- point, since its zone codes are unique city-wide. On a database where this
+-- file has not yet added the column, 005 skips with a notice and this file
+-- adds it; the next `db init` makes the swap.
 --
 -- Done as a separate file rather than an edit to 002_spatial.sql for the
 -- reason 005 gives for its own constraint swap: that file's

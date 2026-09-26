@@ -1,5 +1,5 @@
 -- gold.lot_highest_best_use — the highest and best use of every piece of
--- ground in a borough. One row per (lot, zone).
+-- ground in a cut cell. One row per (lot, zone).
 --
 -- Downstream of silver.lot_development_programs (sql/017), silver.
 -- lot_zoning_envelopes (sql/012) and silver.lot_zone_pieces (sql/025), and the
@@ -87,6 +87,13 @@
 --                         it is a park or a school rather than a grid that
 --                         failed to parse. Per piece, which is what lets a
 --                         parcel that is half park and half housing say both
+--   single_family_zone    the piece's governing columns allow one dwelling
+--                         and no commerce or industry (Montreal's H.1, a
+--                         Quebec grid printing one logement). Left out of
+--                         the solve on purpose: the objective is a rental
+--                         building's and under that cap can only propose one
+--                         small unit. A house needs a sale-price thesis;
+--                         see hbu_dataplatform/docs/single-family.md
 --   no_governing_column   candidate columns exist and none governs — almost
 --                         always ground with no measured frontage under a
 --                         grid stating a width minimum, which reads as 0 m
@@ -119,9 +126,78 @@
 
 SET search_path TO gold, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('gold.lot_highest_best_use');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_highest_best_use_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'gold.lot_highest_best_use was LIST (neighborhood): renamed to '
+        'gold.lot_highest_best_use_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- One row per lot the zoning layer reaches, keyed on the cadastre's own
     -- surrogate key rather than on lot_number — unlike gold.lot_profiles. A
     -- lot the roll never named still has an envelope and a status here, which
@@ -239,14 +315,17 @@ CREATE TABLE IF NOT EXISTS gold.lot_highest_best_use (
     -- The zone is in the key. One row per piece of ground, not per parcel:
     -- see the header, and gold.lot_redevelopment_gap and the three tables
     -- below it, which all follow this key for the same reason.
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id)
+) PARTITION BY LIST (cell_partition);
 
 -- "How many lots are answered, and how many of each unanswered kind" — the
 -- GROUP BY hbu_status the header promises, indexed so it does not have to
--- scan the whole borough for it.
+-- scan the whole cell for it.
 CREATE INDEX IF NOT EXISTS lot_highest_best_use_status_idx
     ON gold.lot_highest_best_use (hbu_status);
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_highest_best_use_neighborhood_idx
+    ON gold.lot_highest_best_use (neighborhood, scrape_date);
 -- The two indexes over `is_primary_zone` and `num_lot_zones` are created in
 -- sql/025 rather than here, and the reason is the order these files run in.
 -- `CREATE TABLE IF NOT EXISTS` above does nothing on a database that already
@@ -255,7 +334,7 @@ CREATE INDEX IF NOT EXISTS lot_highest_best_use_status_idx
 -- yet fails the file, and with it the rest of the init. 025 adds the columns
 -- and the indexes together, which works on a fresh database and on an
 -- existing one alike. See "Re-keying the tables downstream" there.
--- "The most valuable redevelopments in the borough" — the read this table is
+-- "The most valuable redevelopments in the cell" — the read this table is
 -- for once a lot is answered. Partial, the way silver.
 -- lot_assessment_comparables' cap_rate_pct index is: an unanswered lot's NOI
 -- is a different question, not a low answer to this one.
@@ -281,7 +360,7 @@ ALTER TABLE gold.lot_highest_best_use
     ADD COLUMN IF NOT EXISTS governs_industrial boolean,
     ADD COLUMN IF NOT EXISTS hbu_dominant_use text;
 
--- "The most valuable lots in the borough", on the unit the choice was made in.
+-- "The most valuable lots in the cell", on the unit the choice was made in.
 CREATE INDEX IF NOT EXISTS lot_highest_best_use_npv_idx
     ON gold.lot_highest_best_use (npv_cad DESC)
     WHERE solved;

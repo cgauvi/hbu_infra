@@ -27,7 +27,12 @@
 -- a jsonb array on a lot row cannot answer.
 --
 -- Written through urban_rag.warehouse — see 003_warehouse.sql for the
--- partitioning and the upsert both primary keys here exist to serve.
+-- partitioning and the upsert both primary keys here exist to serve. The two
+-- are on the two axes that file describes: the grid is the zone's and a
+-- borough publishes it, so silver.zoning_grid_columns stays on the borough;
+-- the envelope is the lot's, so silver.lot_zoning_envelopes is on the cut
+-- cell with the rest of the lot chain, and reads the grid of each lot's own
+-- borough.
 
 SET search_path TO silver, public;
 
@@ -167,9 +172,79 @@ CREATE INDEX IF NOT EXISTS zoning_grid_columns_solvable_idx
 -- is carried beside it for the readers that need one that survives a reload.
 -- ---------------------------------------------------------------------------
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+-- silver.zoning_grid_columns above is not touched: it stays on the borough.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_zoning_envelopes');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_zoning_envelopes_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_zoning_envelopes was LIST (neighborhood): renamed to '
+        'silver.lot_zoning_envelopes_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too — the one whose grid this row was read from.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     lot_uid      bigint NOT NULL,
     feature_id   text NOT NULL,
     column_index integer NOT NULL,
@@ -310,18 +385,21 @@ CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     solver_error        text,
     parse_notes         jsonb NOT NULL DEFAULT '[]'::jsonb,
     loaded_at           timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id, column_index)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id, column_index)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS lot_zoning_envelopes_lot_number_idx
     ON silver.lot_zoning_envelopes (lot_number);
 CREATE INDEX IF NOT EXISTS lot_zoning_envelopes_zone_idx
     ON silver.lot_zoning_envelopes (feature_id);
--- "Which lots in this borough can be solved for housing" — the read the whole
+-- "Which lots in this cell can be solved for housing" — the read the whole
 -- envelope lineage exists for.
 CREATE INDEX IF NOT EXISTS lot_zoning_envelopes_solvable_idx
     ON silver.lot_zoning_envelopes (lot_uid)
     WHERE governs_residential AND solver_ready;
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_zoning_envelopes_neighborhood_idx
+    ON silver.lot_zoning_envelopes (neighborhood, scrape_date);
 
 -- The two usage families beside Habitation, and the column that governs each
 -- of them for this lot — the solver prices all three now, and the developer's

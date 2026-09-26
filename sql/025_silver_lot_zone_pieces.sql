@@ -101,16 +101,84 @@
 -- `footprint_share_basis` says which of the two the row used.
 --
 -- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_zone_pieces)
--- once that borough's silver.lot_features, silver.lot_frontage and
--- silver.building_lot_intersections rows have landed, and written through
--- urban_rag.warehouse — see 003_warehouse.sql.
+-- one cut cell at a time, once the cell's silver.lot_features,
+-- silver.lot_frontage and silver.building_lot_intersections rows have
+-- landed, and written through urban_rag.warehouse — see 003_warehouse.sql.
 
 SET search_path TO silver, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_zone_pieces');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_zone_pieces_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_zone_pieces was LIST (neighborhood): renamed to '
+        'silver.lot_zone_pieces_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_zone_pieces (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- One row per (lot, zone). Narrower than silver.lot_zoning_envelopes'
     -- (lot, zone, column) on purpose: a piece is a piece of ground, and the
     -- several columns of one grid all describe the same ground.
@@ -206,8 +274,8 @@ CREATE TABLE IF NOT EXISTS silver.lot_zone_pieces (
     -- per piece, not one per lot.
     geom      geometry(MultiPolygon, 4326),
     loaded_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS lot_zone_pieces_geom_idx
     ON silver.lot_zone_pieces USING gist (geom);
@@ -224,6 +292,13 @@ CREATE INDEX IF NOT EXISTS lot_zone_pieces_primary_idx
 CREATE INDEX IF NOT EXISTS lot_zone_pieces_split_idx
     ON silver.lot_zone_pieces (neighborhood, scrape_date)
     WHERE num_lot_zones > 1;
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_zone_pieces_neighborhood_idx
+    ON silver.lot_zone_pieces (neighborhood, scrape_date);
+-- The same reads by ground rather than by borough: a prefix range on the
+-- lot's cell_key is a range over contiguous ground (028_cell_key.sql).
+CREATE INDEX IF NOT EXISTS lot_zone_pieces_cell_key_idx
+    ON silver.lot_zone_pieces (cell_key);
 
 DO $$
 DECLARE

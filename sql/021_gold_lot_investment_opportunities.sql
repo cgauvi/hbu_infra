@@ -3,7 +3,7 @@
 -- (lot, zone), following sql/018 and sql/019.
 --
 -- sql/019 answers *how far is this ground from its highest and best use* for
--- every piece of every parcel in the borough. That is the right question and
+-- every piece of every parcel in the cell. That is the right question and
 -- the wrong shape to act on: twenty-odd thousand rows, most of them
 -- uninteresting, sorted by nothing and faceted by nothing. This table is that
 -- one turned into a shortlist.
@@ -116,10 +116,78 @@
 
 SET search_path TO gold, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('gold.lot_investment_opportunities');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_investment_opportunities_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'gold.lot_investment_opportunities was LIST (neighborhood): renamed to '
+        'gold.lot_investment_opportunities_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS gold.lot_investment_opportunities (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- The bigserial rag.lots mints, and what sql/018 and sql/019 are keyed on.
     -- This table conflicts on it for that reason: it is one join away from
     -- both, and a shortlist row with no program behind it is meaningless.
@@ -205,10 +273,13 @@ CREATE TABLE IF NOT EXISTS gold.lot_investment_opportunities (
     -- The zone is in the key: one row per piece of ground, following
     -- gold.lot_highest_best_use. See sql/018's header for why a parcel is
     -- not always one site.
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id)
+) PARTITION BY LIST (cell_partition);
 
--- "The top residential plays in this borough" — the read this table exists
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_investment_opportunities_neighborhood_idx
+    ON gold.lot_investment_opportunities (neighborhood, scrape_date);
+-- "The top residential plays in this cell" — the read this table exists
 -- for, and one predicate plus an ORDER BY once the index is here. Partial: the
 -- unranked rows are the inventory, not the shortlist, and carrying every lane
 -- in the borough would answer neither question.
@@ -350,7 +421,8 @@ ALTER TABLE gold.lot_investment_opportunities
 --
 -- **Read across lot_uid, not on it**, for the reason sql/019's header gives:
 -- the map joins this table to rag.lots on (neighborhood, scrape_date,
--- lot_number).
+-- lot_number) — the borough as an attribute now, not the partition, which is
+-- why the index below is still on it.
 --
 -- ADD COLUMN IF NOT EXISTS, like every widening here, so a partition written
 -- before the second axis existed keeps its rows with these NULL.
@@ -411,6 +483,10 @@ CREATE INDEX IF NOT EXISTS lot_investment_opportunities_site_thesis_idx
 CREATE INDEX IF NOT EXISTS lot_investment_opportunities_site_lot_idx
     ON gold.lot_investment_opportunities (neighborhood, scrape_date, lot_number)
     WHERE site_thesis IS NOT NULL AND site_thesis <> 'none';
+-- The same read by ground rather than by borough: a prefix range on the lot's
+-- cell_key is a range over contiguous ground (028_cell_key.sql).
+CREATE INDEX IF NOT EXISTS lot_investment_opportunities_cell_key_idx
+    ON gold.lot_investment_opportunities (cell_key);
 
 -- ---------------------------------------------------------------------------
 -- Widening: the three futures, for the owner and for a buyer

@@ -1,5 +1,5 @@
 -- silver.lot_development_programs — what may profitably be built under every
--- zoning envelope of one borough, one row per (lot, grid column).
+-- zoning envelope of one cut cell, one row per (lot, grid column).
 --
 -- The same grain and the same key as silver.lot_zoning_envelopes (sql/012):
 -- one candidate program per (lot_uid, feature_id, column_index), because it is
@@ -74,10 +74,79 @@
 
 SET search_path TO silver, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_development_programs');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_development_programs_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_development_programs was LIST (neighborhood): renamed to '
+        'silver.lot_development_programs_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too — whose CMHC rents the solve was priced at, and what the map
+    -- reads by.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- The same grain as silver.lot_zoning_envelopes: one row per (lot,
     -- zone, grid column). lot_uid rather than lot_number for the reason that
     -- table gives — it is the cadastre's own surrogate key, and a candidate
@@ -234,8 +303,8 @@ CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
     program_assumptions jsonb NOT NULL DEFAULT '{}'::jsonb,
 
     loaded_at    timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id, column_index)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id, column_index)
+) PARTITION BY LIST (cell_partition);
 
 -- "Every candidate on this lot" — the read gold.lot_highest_best_use exists to
 -- spare a caller, and the one this table is for when that spared read is not
@@ -247,12 +316,15 @@ CREATE INDEX IF NOT EXISTS lot_development_programs_lot_idx
 CREATE INDEX IF NOT EXISTS lot_development_programs_governing_idx
     ON silver.lot_development_programs (lot_uid)
     WHERE governs_residential AND solved;
--- "Every borough-wide model that ran out of time" — num_not_optimal on the
+-- "Every model in the cell that ran out of time" — num_not_optimal on the
 -- asset's own metadata, indexed so the handful can be found rather than only
 -- counted.
 CREATE INDEX IF NOT EXISTS lot_development_programs_status_idx
     ON silver.lot_development_programs (status)
     WHERE status NOT IN ('OPTIMAL', 'INFEASIBLE');
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_development_programs_neighborhood_idx
+    ON silver.lot_development_programs (neighborhood, scrape_date);
 
 -- The discounted objective and the family flags, added when the solver
 -- stopped maximising a monthly NOI and started maximising discounted net
@@ -274,7 +346,7 @@ ALTER TABLE silver.lot_development_programs
     ADD COLUMN IF NOT EXISTS governs_commercial boolean,
     ADD COLUMN IF NOT EXISTS governs_industrial boolean;
 
--- "The most valuable programs in the borough", on the objective's own unit.
+-- "The most valuable programs in the cell", on the objective's own unit.
 CREATE INDEX IF NOT EXISTS lot_development_programs_npv_idx
     ON silver.lot_development_programs (npv_cad DESC)
     WHERE solved;

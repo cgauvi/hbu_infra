@@ -10,9 +10,10 @@
 -- publisher records it: Infolot draws the parcel, the géobase double draws the
 -- sides of the roadway, and what connects them is geometry.
 --
--- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_frontage) once
--- that borough's rag.lots and silver.neighborhood_streets rows have landed,
--- and written through urban_rag.warehouse — see 003_warehouse.sql.
+-- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_frontage) one
+-- cut cell at a time — the cell's rag.lots against every side in the
+-- snapshot's silver.neighborhood_streets — and written through
+-- urban_rag.warehouse; see 003_warehouse.sql.
 --
 -- Two things about the measure are worth knowing before reading a number here.
 --
@@ -63,17 +64,87 @@
 -- bigserial one, and a foreign key has nothing left to reference. Neither is a
 -- loss: `cote_rue_id` is the publisher's own key for a street side, it is what
 -- this table already denormalised because the serial did not survive a reload,
--- and the pairing is enforced by the partition instead. Both tables are keyed
--- on (scrape_date, neighborhood, …) and the join that fills this one runs
--- inside a single partition of both. The old table is left in place; drop it
--- once nothing reads it:
+-- and the pairing is enforced by the snapshot instead. Both tables are keyed
+-- on (scrape_date, cell_partition, …), and the join that fills this one takes
+-- the cell's lots against every side of the same scrape_date, whichever cell
+-- owns the side — a lot on a cell edge faces a street across it. The old
+-- table is left in place; drop it once nothing reads it:
 --
 --     DROP TABLE IF EXISTS rag.lot_frontage;
 
 SET search_path TO silver, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_frontage');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I', target, 'lot_frontage_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_frontage was LIST (neighborhood): renamed to '
+        'silver.lot_frontage_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_frontage (
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) — not the side's, which
+    -- may be owned by the cell next door — and the borough is the lot's,
+    -- carried for the map's per-borough reads.
     scrape_date      date NOT NULL,
+    cell_key         text COLLATE "C" NOT NULL,
+    cell_partition   text COLLATE "C" NOT NULL,
     neighborhood     text NOT NULL,
     lot_uid          bigint NOT NULL
         REFERENCES rag.lots (lot_uid) ON DELETE CASCADE,
@@ -101,8 +172,8 @@ CREATE TABLE IF NOT EXISTS silver.lot_frontage (
     -- MultiLineString for one that meets the same side twice.
     geom             geometry(Geometry, 4326),
     loaded_at        timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, cote_rue_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, cote_rue_id)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS lot_frontage_geom_idx
     ON silver.lot_frontage USING gist (geom);
@@ -110,15 +181,18 @@ CREATE INDEX IF NOT EXISTS lot_frontage_lot_idx
     ON silver.lot_frontage (lot_uid);
 CREATE INDEX IF NOT EXISTS lot_frontage_lot_number_idx
     ON silver.lot_frontage (lot_number);
--- "The widest lots in this borough, longest first" is the read this table
+-- "The widest lots in this cell, longest first" is the read this table
 -- exists for, so it gets an index rather than a sort. The partition already
--- narrows to the borough-month, so the index only has to carry the ordering.
+-- narrows to the cell-month, so the index only has to carry the ordering.
 CREATE INDEX IF NOT EXISTS lot_frontage_longest_idx
     ON silver.lot_frontage (frontage_m DESC);
 -- "The primary frontage of every lot" — frontage_rank = 1 — is the other.
 CREATE INDEX IF NOT EXISTS lot_frontage_primary_idx
     ON silver.lot_frontage (lot_uid)
     WHERE frontage_rank = 1;
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_frontage_neighborhood_idx
+    ON silver.lot_frontage (neighborhood, scrape_date);
 
 DO $$
 DECLARE

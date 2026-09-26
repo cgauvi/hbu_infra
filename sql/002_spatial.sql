@@ -48,7 +48,13 @@ CREATE TABLE IF NOT EXISTS rag.features (
     -- MI_Transform. Geometry type is left open because one table's rows are
     -- polygons and another's are points.
     geom         geometry(Geometry, 4326),
-    UNIQUE (source_table, feature_id, scrape_date)
+    -- Unique per publisher's namespace, not per borough: the file slug in
+    -- `source_table` drops the namespace, and zone numbers restart in every
+    -- borough. `neighborhood` above is the borough that loaded the row and is
+    -- not part of it. On an existing database 005_silver_lot_features.sql
+    -- makes the same swap, since this CREATE is a no-op there.
+    CONSTRAINT features_identity_key
+        UNIQUE (source_table, feature_id, source_namespace, scrape_date)
 );
 
 CREATE INDEX IF NOT EXISTS features_geom_idx ON rag.features USING gist (geom);

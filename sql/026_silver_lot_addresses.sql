@@ -88,9 +88,14 @@
 -- is_primary_address marks the lowest-numbered door — the one a map labels the
 -- parcel with.
 --
--- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_addresses) once
--- that borough's rag.lots and silver.lot_zone_pieces rows have landed, and
--- written through urban_rag.warehouse — see 003_warehouse.sql.
+-- Computed by hbu_dataplatform (urban_rag.postgis.compute_lot_addresses) one
+-- cut cell at a time — the addresses the cell owns, snapped against every lot
+-- in the snapshot, so a point 2 m across a borough line still lands — and
+-- written through urban_rag.warehouse; see 003_warehouse.sql.
+--
+-- silver.lot_addresses is on the cut cell with the rest of the lot chain, and
+-- a row belongs to the cell of its own point, not of its lot: an address is
+-- the one row here with ground of its own. rag.addresses stays a plain table.
 
 SET search_path TO silver, public;
 
@@ -130,10 +135,78 @@ CREATE INDEX IF NOT EXISTS addresses_partition_idx
 -- The published table
 -- ---------------------------------------------------------------------------
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('silver.lot_addresses');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_addresses_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'silver.lot_addresses was LIST (neighborhood): renamed to '
+        'silver.lot_addresses_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS silver.lot_addresses (
-    -- The partition key leads, in the order 003_warehouse.sql explains.
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the point's own (rag.addresses, 028_cell_key.sql). The
+    -- borough is the lot's, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- The grain: one address point. Keyed on the publisher's UUID rather than
     -- on (lot_uid, feature_id), because a site legitimately carries many
     -- addresses and keying on the site would let them overwrite each other.
@@ -194,8 +267,8 @@ CREATE TABLE IF NOT EXISTS silver.lot_addresses (
 
     geom      geometry(Point, 4326),
     loaded_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (scrape_date, neighborhood, address_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, address_id)
+) PARTITION BY LIST (cell_partition);
 
 CREATE INDEX IF NOT EXISTS lot_addresses_geom_idx
     ON silver.lot_addresses USING gist (geom);
@@ -216,6 +289,9 @@ CREATE INDEX IF NOT EXISTS lot_addresses_street_idx
     ON silver.lot_addresses (lower(street_name), civic_number);
 CREATE INDEX IF NOT EXISTS lot_addresses_postal_idx
     ON silver.lot_addresses (postal_code);
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_addresses_neighborhood_idx
+    ON silver.lot_addresses (neighborhood, scrape_date);
 
 DO $$
 DECLARE

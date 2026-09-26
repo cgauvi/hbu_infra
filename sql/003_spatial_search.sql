@@ -29,11 +29,19 @@ SET search_path TO rag, public;
 -- at that document. Expanding it into a join is what connects the corpus to
 -- geometry, and doing it in a view means the expansion is written once.
 --
--- The borough is part of the match, not just of the partition: `source_table`
--- on both sides is the file slug (`Reglement_urbanisme__VSP_REG_ZONE`), which
--- drops the namespace the Spectrum path carries, and zone numbers restart at
+-- The publisher's namespace is part of the match: `source_table` on both
+-- sides is the file slug (`Reglement_urbanisme__VSP_REG_ZONE`), which drops
+-- the namespace the Spectrum path carries, and zone numbers restart at
 -- C01-001 in every borough. Without it a Villeray grid would come back cited
 -- by a Rosemont zone of the same number.
+--
+-- A chunk carries the borough its corpus was indexed under and no namespace;
+-- a feature carries its namespace, which is what identifies it since
+-- 005_silver_lot_features.sql moved `features_identity_key` onto it. The
+-- bridge is rag.features itself — the namespace a borough's own features were
+-- filed under — so the match holds where one namespace spans several
+-- boroughs (Quebec City's arrondissements share one layer, and a zone is kept
+-- once, under whichever arrondissement loaded it first).
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW rag.chunk_features AS
@@ -46,8 +54,15 @@ CREATE OR REPLACE VIEW rag.chunk_features AS
       JOIN rag.features f
         ON f.feature_id = fid.value
        AND f.source_table = c.source_table
-       AND f.neighborhood = c.neighborhood
-       AND f.scrape_date = c.scrape_date;
+       AND f.scrape_date = c.scrape_date
+       AND EXISTS (
+           SELECT 1
+             FROM rag.features ns
+            WHERE ns.source_table = c.source_table
+              AND ns.source_namespace = f.source_namespace
+              AND ns.scrape_date = c.scrape_date
+              AND ns.neighborhood = c.neighborhood
+       );
 
 -- ---------------------------------------------------------------------------
 -- Vector search narrowed to a place
@@ -158,14 +173,25 @@ AS $$
       JOIN rag.features f ON ST_Intersects(f.geom, lot.geom)
       JOIN rag.chunks c
         ON c.source_table = f.source_table
-       AND c.neighborhood = f.neighborhood
        AND c.scrape_date = f.scrape_date
        AND c.feature_ids ? f.feature_id
+       -- The feature's namespace, reached from the chunk's borough the way
+       -- rag.chunk_features above explains.
+       AND EXISTS (
+           SELECT 1
+             FROM rag.features ns
+            WHERE ns.source_table = c.source_table
+              AND ns.source_namespace = f.source_namespace
+              AND ns.scrape_date = c.scrape_date
+              AND ns.neighborhood = c.neighborhood
+       )
      ORDER BY c.embedding <=> query_embedding
      LIMIT match_count;
 $$;
 
 -- What is loaded, at a glance — the spatial companion to rag.chunks_meta.
+-- Per borough, because the corpus is: a borough publishes its documents and
+-- files its features, and both counts are of what that borough loaded.
 CREATE OR REPLACE VIEW rag.corpus_status AS
     SELECT c.neighborhood,
            c.scrape_date,

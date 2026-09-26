@@ -98,9 +98,78 @@
 
 SET search_path TO gold, public;
 
+-- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
+-- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
+DO $migrate$
+DECLARE
+    target  regclass := to_regclass('gold.lot_redevelopment_gap');
+    old_key text;
+    item    record;
+    renamed text[] := '{}';
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT a.attname
+      INTO old_key
+      FROM pg_partitioned_table p
+      JOIN pg_attribute a
+        ON a.attrelid = p.partrelid AND a.attnum = p.partattrs[0]
+     WHERE p.partrelid = target;
+
+    IF old_key IS DISTINCT FROM 'neighborhood' THEN
+        RETURN;
+    END IF;
+
+    FOR item IN
+        SELECT i.indexrelid::regclass AS index_oid, ic.relname AS name
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = target
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid
+           )
+    LOOP
+        EXECUTE format(
+            'ALTER INDEX %s RENAME TO %I', item.index_oid, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    FOR item IN
+        SELECT conname AS name
+          FROM pg_constraint
+         WHERE conrelid = target AND contype IN ('p', 'u', 'f', 'c')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+            target, item.name, item.name || '_bn'
+        );
+        renamed := renamed || item.name;
+    END LOOP;
+
+    EXECUTE format(
+        'ALTER TABLE %s RENAME TO %I',
+        target, 'lot_redevelopment_gap_by_neighborhood'
+    );
+
+    RAISE NOTICE
+        'gold.lot_redevelopment_gap was LIST (neighborhood): renamed to '
+        'gold.lot_redevelopment_gap_by_neighborhood; suffixed _bn: %',
+        array_to_string(renamed, ', ');
+END
+$migrate$;
+
 CREATE TABLE IF NOT EXISTS gold.lot_redevelopment_gap (
-    scrape_date  date NOT NULL,
-    neighborhood text NOT NULL,
+    -- The partition key leads, in the order 003_warehouse.sql explains; the
+    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- lot's too, carried for the map's per-borough reads.
+    scrape_date    date NOT NULL,
+    cell_key       text COLLATE "C" NOT NULL,
+    cell_partition text COLLATE "C" NOT NULL,
+    neighborhood   text NOT NULL,
     -- Keyed on (lot_uid, feature_id), like gold.lot_highest_best_use and for
     -- both of its reasons. lot_uid rather than lot_number because a lot with
     -- an envelope and no assessed building — the parcel is_underbuilt exists
@@ -212,11 +281,11 @@ CREATE TABLE IF NOT EXISTS gold.lot_redevelopment_gap (
     -- The zone is in the key: one row per piece of ground, following
     -- gold.lot_highest_best_use. See sql/018's header for why a parcel is
     -- not always one site.
-    PRIMARY KEY (scrape_date, neighborhood, lot_uid, feature_id)
-) PARTITION BY LIST (neighborhood);
+    PRIMARY KEY (scrape_date, cell_partition, lot_uid, feature_id)
+) PARTITION BY LIST (cell_partition);
 
--- "The most under-built lots in the borough" — the read this table exists
--- for, and the list a highest-and-best-use question starts from.
+-- "The most under-built lots in the cell" — the read this table exists for,
+-- and the list a highest-and-best-use question starts from.
 CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_underbuilt_idx
     ON gold.lot_redevelopment_gap (annual_stabilised_noi_gap_cad DESC)
     WHERE is_underbuilt;
@@ -225,6 +294,9 @@ CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_underbuilt_idx
 CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_unassessed_idx
     ON gold.lot_redevelopment_gap (lot_uid)
     WHERE NOT has_assessment;
+-- The map's per-borough read, which used to be partition pruning.
+CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_neighborhood_idx
+    ON gold.lot_redevelopment_gap (neighborhood, scrape_date);
 
 -- The discounted verdict this table used to stop short of, priced at the
 -- same InvestmentAssumptions the solve ran with (carried in the hbu row's
@@ -315,7 +387,9 @@ ALTER TABLE gold.lot_redevelopment_gap
 --
 --   enhance_status              CP-SAT's status, or why there was nothing to
 --                               solve: no_building, not_underbuilt, no_program,
---                               no_envelope
+--                               no_envelope, single_family_zone (the piece is
+--                               zoned for one dwelling and not priced as
+--                               rental at all)
 --   enhance_npv_cad             the addition's present value less its capital
 --   enhance_disruption_cad      the standing NOI lost while the works are on
 --   enhance_gain_cad            enhance_npv_cad - enhance_disruption_cad: what
