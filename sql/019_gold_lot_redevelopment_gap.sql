@@ -297,6 +297,18 @@ CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_unassessed_idx
 -- The map's per-borough read, which used to be partition pruning.
 CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_neighborhood_idx
     ON gold.lot_redevelopment_gap (neighborhood, scrape_date);
+-- The join the tile renderer makes per tile: the piece of
+-- silver.lot_zone_pieces to its gap row, on the cadastral number and the
+-- zone (the two that survive a reload of rag.lots). Without it the planner
+-- hashes the borough's whole gap table for every tile - 4 s a band on
+-- Saguenay against 0.13 s with it (measured 2026-09-26). The primary key
+-- starts with cell_partition, which a tile query does not know.
+CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_piece_idx
+    ON gold.lot_redevelopment_gap (lot_number, feature_id);
+-- The same probe from the massing and surface-parking layers, whose
+-- `is_underbuilt` EXISTS is keyed on lot_uid.
+CREATE INDEX IF NOT EXISTS lot_redevelopment_gap_lot_uid_idx
+    ON gold.lot_redevelopment_gap (lot_uid);
 
 -- The discounted verdict this table used to stop short of, priced at the
 -- same InvestmentAssumptions the solve ran with (carried in the hbu row's

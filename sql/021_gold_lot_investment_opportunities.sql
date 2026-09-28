@@ -279,6 +279,11 @@ CREATE TABLE IF NOT EXISTS gold.lot_investment_opportunities (
 -- The map's per-borough read, which used to be partition pruning.
 CREATE INDEX IF NOT EXISTS lot_investment_opportunities_neighborhood_idx
     ON gold.lot_investment_opportunities (neighborhood, scrape_date);
+-- The join the tile renderer's opportunities layer makes per tile, from the
+-- piece of silver.lot_zone_pieces on the cadastral number and the zone (see
+-- sql/019's lot_redevelopment_gap_piece_idx).
+CREATE INDEX IF NOT EXISTS lot_investment_opportunities_piece_idx
+    ON gold.lot_investment_opportunities (lot_number, feature_id);
 -- "The top residential plays in this cell" — the read this table exists
 -- for, and one predicate plus an ORDER BY once the index is here. Partial: the
 -- unranked rows are the inventory, not the shortlist, and carrying every lane

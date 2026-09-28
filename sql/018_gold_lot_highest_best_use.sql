@@ -326,6 +326,13 @@ CREATE INDEX IF NOT EXISTS lot_highest_best_use_status_idx
 -- The map's per-borough read, which used to be partition pruning.
 CREATE INDEX IF NOT EXISTS lot_highest_best_use_neighborhood_idx
     ON gold.lot_highest_best_use (neighborhood, scrape_date);
+-- The join the tile renderer's land_use layer makes per tile, from the gap
+-- row to this one on (lot_uid, feature_id). The primary key starts with
+-- cell_partition, which a tile query does not know, so without this the
+-- planner hashed the borough's whole table for every tile (see sql/019's
+-- lot_redevelopment_gap_piece_idx for the measurement).
+CREATE INDEX IF NOT EXISTS lot_highest_best_use_piece_idx
+    ON gold.lot_highest_best_use (lot_uid, feature_id);
 -- The two indexes over `is_primary_zone` and `num_lot_zones` are created in
 -- sql/025 rather than here, and the reason is the order these files run in.
 -- `CREATE TABLE IF NOT EXISTS` above does nothing on a database that already
