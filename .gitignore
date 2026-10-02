@@ -19,3 +19,6 @@ __pycache__/
 
 # Local
 .env
+
+# Database dumps (`make db-dump`) — gigabytes, and S3 is their off-machine home
+backups/

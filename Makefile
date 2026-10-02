@@ -25,6 +25,22 @@
 #   make app-push app-deploy ENV=dev  # ship a code change
 #   make app-logs    ENV=dev        # tail the container
 #
+#   # moving the data off AWS first — see "Moving the database off AWS" in the
+#   # README. The dump is the artifact that travels: to the local container,
+#   # to S3, to another machine.
+#   make db-dump-remote ENV=dev     # pg_dump on the bastion -> S3 -> backups/
+#   make db-restore-local           # ...into hbu_rag_map's local container
+#   make db-dump-pull               # (any other machine: newest dump from S3)
+#
+#   # the tunnel-only variants, for when the bastion is already gone — slow:
+#   make db-tunnel ENV=dev          # one shell, left running
+#   make db-dump   ENV=dev TUNNEL=1 # another; db-dump-push sends it to S3
+#
+#   # taking it down a part at a time (each waits for its name typed back):
+#   make destroy-app     ENV=dev    # the ALB + Fargate service — most of the bill
+#   make destroy-bastion ENV=dev    # the jump host — severs db-* to a private DB
+#   make destroy-db      ENV=dev    # the RDS instance and everything in it
+#
 #   # taking it all down again, in this order:
 #   make destroy-all                # every env stack, then the shared one
 #   make destroy-bootstrap          # ...and the state backend that held them
@@ -240,9 +256,10 @@ DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tu
 
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
-        destroy-all destroy-bootstrap \
+        destroy-all destroy-bootstrap destroy-app destroy-bastion destroy-db \
         db-deps uv-check db-init db-check db-shell db-url db-secret db-env \
         db-query db-wait db-start db-stop db-tunnel \
+        db-dump db-dump-remote db-restore-local db-dump-push db-dump-pull \
         app-login app-build app-push app-deploy app-status app-wait app-logs \
         app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token
 
@@ -252,9 +269,11 @@ help:
 # Order-only so a failure stops the run before anything touches AWS, and so the
 # check runs once per invocation no matter how many of these are named.
 bootstrap init-shared plan-shared apply-shared destroy-shared \
-init plan apply destroy validate output destroy-all destroy-bootstrap: | aws-check
+init plan apply destroy validate output destroy-all destroy-bootstrap \
+destroy-app destroy-bastion destroy-db: | aws-check
 db-init db-bootstrap db-ca db-check db-shell db-url db-secret db-env db-app-env \
-db-query db-wait db-start db-stop db-tunnel: | aws-check
+db-query db-wait db-start db-stop db-tunnel \
+db-dump db-dump-remote db-dump-push db-dump-pull: | aws-check
 app-login app-build app-push app-deploy app-status app-wait app-logs \
 app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token: | aws-check
 
@@ -501,6 +520,58 @@ destroy-bootstrap: ## Destroy the state bucket, lock table, and GitHub deploy ro
 	else echo "s3://$(BUCKET) is gone. Nothing of this project is left in AWS." >&2; fi
 
 # ---------------------------------------------------------------------------
+# Partial teardown — one part of ENV at a time, in the order the bill suggests
+#
+#   make destroy-app     ENV=dev   # the ALB + Fargate service (~$39/mo idle)
+#   make destroy-bastion ENV=dev   # the jump host (~$7/mo)
+#   make destroy-db      ENV=dev   # the instance itself — dump it out first
+#
+# destroy-app and destroy-bastion are the enable_* toggles applied off: the
+# same thing as editing the tfvars, minus the edit. That is also their catch —
+# the tfvars still says true, so the next plain `make plan apply` puts the part
+# back. Edit $(ENV).tfvars to make either permanent.
+#
+# destroy-db is a targeted destroy instead, because the instance has no
+# toggle. Terraform takes its dependents with it — the /hbu-$(ENV)/db/* SSM
+# contract, the db_access policy, the stop/start schedules — and warns that
+# -target is for exceptional use; removing one resource from a stack you are
+# keeping is that exception. What it leaves behind (parameter group, log
+# group, security group, the empty app-role secret) costs pennies and is
+# re-adopted by the next `make plan apply`, which recreates an *empty*
+# instance: the data comes back with `make db-restore-local` in reverse, or
+# not at all — see "Moving the database off AWS" in the README.
+# ---------------------------------------------------------------------------
+
+destroy-app: init ## Remove the ALB + ECS service from ENV (DB and bastion stay)
+	@echo "This removes from $(ENV): the load balancer — and its DNS name, so any" >&2
+	@echo "CNAME pointing at it must be repointed after a re-create — the ECS" >&2
+	@echo "cluster and service, and the app's three secrets (password, HF token," >&2
+	@echo "Mapbox token), which block re-creation under the same name for their" >&2
+	@echo "7-day recovery window. $(ENV).tfvars still sets enable_app = true, so" >&2
+	@echo "the next plain \`make plan apply\` puts it all back; edit the tfvars to" >&2
+	@echo "make this permanent." >&2
+	@$(call confirm,destroy-app)
+	$(TF) apply $(TF_VARS) -var="enable_app=false" $(TF_APPROVE)
+
+destroy-bastion: init ## Remove the SSM bastion from ENV — severs db-* to a private DB
+	@echo "This removes the $(ENV) bastion. With db_subnet_tier = private that" >&2
+	@echo "was the only path from a laptop: db-tunnel, db-dump, db-shell and the" >&2
+	@echo "rest keep working only until the current SSM session ends. Same catch" >&2
+	@echo "as destroy-app: $(ENV).tfvars still says enable_bastion = true." >&2
+	@$(call confirm,destroy-bastion)
+	$(TF) apply $(TF_VARS) -var="enable_bastion=false" $(TF_APPROVE)
+
+destroy-db: init ## Destroy ONLY the RDS instance (VPC, app, bastion stay)
+	@$(call preflight_destroy,$(ENV))
+	@echo "This deletes the $(PROJECT)-$(ENV) instance and every row in it." >&2
+	@grep -qE '^[[:space:]]*db_skip_final_snapshot[[:space:]]*=[[:space:]]*true' $(ENV).tfvars 2>/dev/null \
+	  && echo "$(ENV) takes no final snapshot — without a dump, the data leaves no copy." >&2 \
+	  || true
+	@echo "Its SSM contract, IAM policy and stop/start schedules go with it." >&2
+	@$(call confirm,destroy-db)
+	$(TF) destroy $(TF_VARS) -target=aws_db_instance.main $(TF_APPROVE)
+
+# ---------------------------------------------------------------------------
 # Database
 #
 # Every target below resolves the endpoint and password from SSM and Secrets
@@ -590,6 +661,150 @@ db-stop: ## Stop the instance
 # one-shot session) and for why a public endpoint is not the simpler answer.
 db-tunnel: ## Supervised port-forward through the SSM bastion to 127.0.0.1:$(LOCAL_PORT)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)
+
+# ---------------------------------------------------------------------------
+# Getting the data out — see "Moving the database off AWS" in the README
+#
+#   make db-dump-remote ENV=dev     # the fast path: bastion -> S3 -> backups/
+#   make db-restore-local           # the dump into hbu_rag_map's container
+#   make db-dump-pull               # (another machine) newest dump from S3
+#
+#   make db-dump ENV=dev TUNNEL=1   # the slow path, through an open db-tunnel
+#   make db-dump-push               # ...and that artifact to S3
+#
+# The dump is the artifact that travels. It is a `pg_dump --format=custom` of
+# the whole database — rag, silver, gold and dagster, schema and data — which
+# is both the migration to the local container and the off-machine copy, where
+# a tar of the pgdata volume would be neither: twice the size, pinned to one
+# postgres build, and restorable only into docker.
+#
+# On the laptop side pg_dump and pg_restore run inside the local database
+# image rather than on the host, so their version always matches the server
+# they talk to and nothing has to be installed. The image is hbu_rag_map's
+# local stand-in (postgis + pgvector, built by `make db-up` over there), which
+# is also where db-restore-local puts the data.
+# ---------------------------------------------------------------------------
+
+BACKUP_DIR    ?= backups
+# The dataplatform's own bucket — it survives every stack here on purpose, so
+# the parquet, the tiles and these dumps all outlive the RDS.
+BACKUP_BUCKET ?= urban-rag-dataplatform
+BACKUP_PREFIX ?= backups/db
+# Parallel restore workers. 4 is sensible for a laptop; 1 to stay out of the way.
+RESTORE_JOBS  ?= 4
+
+PG_CLIENT_IMAGE    ?= hbu-rag-map/postgis-pgvector:16
+LOCAL_DB_CONTAINER ?= hbu-rag-map-db
+
+# Git Bash rewrites leading-slash arguments into C:\... paths on the way to a
+# native docker.exe, which turns `/tmp/restore.dump` inside the container into
+# a host path that does not exist there — and the MSYS_NO_PATHCONV env guard
+# does not reliably survive a make recipe's shell (verified: pg_dump was handed
+# C:/Users/.../Git/backups/... inside the container with the guard in place).
+# So every in-container absolute path below is written with a double slash,
+# which the MSYS runtime leaves alone and Linux reads as a single one. The env
+# guard stays as a belt for the arguments that are not paths at all.
+DOCKER_NOCONV = MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+
+# The newest dump under $(BACKUP_DIR), unless DUMP= names one. Resolved in the
+# recipes (`=` would still be too early), shared so push and restore agree on
+# what "the latest" means.
+define resolve_dump
+dump="$(DUMP)"; [ -n "$$dump" ] || dump=$$(ls -t $(BACKUP_DIR)/*.dump 2>/dev/null | head -1); \
+[ -n "$$dump" ] && [ -f "$$dump" ] || { \
+  echo "no dump under $(BACKUP_DIR)/ — run \`make db-dump ENV=$(ENV) TUNNEL=1\` first," >&2; \
+  echo "  \`make db-dump-pull\` to fetch one from S3, or pass DUMP=<path>." >&2; exit 1; }
+endef
+
+# The whole database, through the tunnel, into one compressed archive. The
+# credentials come from the same place every other db-* target gets them, so
+# this takes no host or password; the master user reads everything because
+# 000_roles.sql grants it the urban_rag role WITH INHERIT. Written to a .part
+# first so a dump killed halfway — the tunnel dropping, the 22:30 scheduled
+# stop — never leaves something that looks like a finished artifact.
+db-dump: ## pg_dump of ENV into backups/ (through an open db-tunnel: TUNNEL=1)
+	@mkdir -p $(BACKUP_DIR)
+	@eval "$$($(DB) env)"; \
+	host="$$PGHOST"; [ "$$host" = "127.0.0.1" ] && host=host.docker.internal; \
+	$(DOCKER_NOCONV) docker run --rm --add-host=host.docker.internal:host-gateway \
+	  -e PGPASSWORD="$$PGPASSWORD" $(PG_CLIENT_IMAGE) \
+	  pg_isready -h "$$host" -p "$$PGPORT" -t 10 >/dev/null || { \
+	    echo "cannot reach $$host:$$PGPORT from a container." >&2; \
+	    echo "  with TUNNEL=1: is \`make db-tunnel ENV=$(ENV)\` still running — and the" >&2; \
+	    echo "  instance started? (the dev schedule stops it 22:30-07:00.)" >&2; \
+	    echo "  without TUNNEL=1 this dials the endpoint directly, which only works" >&2; \
+	    echo "  from inside the VPC: open a tunnel and re-run with TUNNEL=1." >&2; \
+	    exit 1; }; \
+	ts=$$(date +%Y%m%d-%H%M%S); out="hbu-$(ENV)-$$ts.dump"; \
+	bdir=$$(cd $(BACKUP_DIR) && { pwd -W 2>/dev/null || pwd; }); \
+	echo "==> pg_dump $(ENV) -> $(BACKUP_DIR)/$$out" >&2; \
+	$(DOCKER_NOCONV) docker run --rm --add-host=host.docker.internal:host-gateway \
+	  -e PGHOST="$$host" -e PGPORT="$$PGPORT" -e PGUSER="$$PGUSER" \
+	  -e PGPASSWORD="$$PGPASSWORD" -e PGDATABASE="$$PGDATABASE" -e PGSSLMODE=require \
+	  -v "$$bdir:/backups" $(PG_CLIENT_IMAGE) \
+	  pg_dump --format=custom --compress=6 --no-password \
+	    --file="//backups/$$out.part" \
+	&& mv "$(BACKUP_DIR)/$$out.part" "$(BACKUP_DIR)/$$out" \
+	&& ls -lh "$(BACKUP_DIR)/$$out"
+
+# Into hbu_rag_map's local container, REPLACING whatever urban_rag database it
+# holds. The container is left to that repo to run (`make db-up` there);
+# `--no-owner --no-acl` because the restoring role owns the whole local
+# database and the RDS-side roles (hbu_admin, urban_rag_ro) do not exist here.
+#
+# pg_restore runs in a throwaway client container that mounts $(BACKUP_DIR)
+# and dials the published port — the same shape as db-dump — rather than
+# `docker cp` + `docker exec`: cp needs a bare container:/path argument, which
+# is exactly what the MSYS runtime mangles (and the // spelling that saves a
+# mounted path confuses docker cp instead). The drop/create steps are fatal on
+# failure; pg_restore's own exit code is reported but not, because the count
+# table printed at the end is the real verdict and a 45-minute restore should
+# not read as wasted over one benign warning.
+db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
+	@$(call resolve_dump); \
+	docker exec $(LOCAL_DB_CONTAINER) pg_isready -U urban_rag -d postgres >/dev/null 2>&1 || { \
+	  echo "the local container is not running. In $(APP_DIR):  make db-up" >&2; exit 1; }; \
+	echo "==> replacing database urban_rag in $(LOCAL_DB_CONTAINER) with $$dump" >&2; \
+	docker exec $(LOCAL_DB_CONTAINER) dropdb -U urban_rag --force --if-exists urban_rag || exit 1; \
+	docker exec $(LOCAL_DB_CONTAINER) createdb -U urban_rag urban_rag || exit 1; \
+	bdir=$$(cd "$$(dirname "$$dump")" && { pwd -W 2>/dev/null || pwd; }); \
+	f=$$(basename "$$dump"); \
+	$(DOCKER_NOCONV) docker run --rm --add-host=host.docker.internal:host-gateway \
+	  -v "$$bdir:/backups" -e PGPASSWORD=urban_rag $(PG_CLIENT_IMAGE) \
+	  pg_restore -h host.docker.internal -p "$${HBU_LOCAL_PG_PORT:-5432}" \
+	    -U urban_rag -d urban_rag --no-owner --no-acl \
+	    --jobs=$(RESTORE_JOBS) "//backups/$$f" \
+	  || echo "pg_restore reported errors above — check the counts below before trusting or redoing" >&2; \
+	echo "==> ANALYZE" >&2; \
+	docker exec $(LOCAL_DB_CONTAINER) psql -q -U urban_rag -d urban_rag -c "ANALYZE;"; \
+	docker exec $(LOCAL_DB_CONTAINER) psql -U urban_rag -d urban_rag -c \
+	  "select schemaname, count(*) as tables, pg_size_pretty(sum(pg_total_relation_size(schemaname||'.'||quote_ident(tablename)))::bigint) as size from pg_tables where schemaname in ('rag','silver','gold','dagster') group by 1 order by 1;"; \
+	echo "point the apps at it:" >&2; \
+	echo "  DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:$${HBU_LOCAL_PG_PORT:-5432}/urban_rag?sslmode=disable" >&2
+
+# The fast path, and the one to prefer for a full copy: the tunnel the target
+# above rides tops out around 300 KB/s per SSM session (parallel connections
+# share the one websocket — measured 2026-10-01), which on this database is
+# half a day and a death at the 22:30 scheduled stop. This one runs pg_dump on
+# the bastion instead — VPC speed next to the instance, EC2 speed up to S3 —
+# and needs no tunnel at all; it ends by pulling the artifact down here.
+db-dump-remote: ## pg_dump on the bastion straight to S3, then pulled here — the fast path
+	PYTHONUNBUFFERED=1 $(DB) dump-remote --bucket "$(BACKUP_BUCKET)" --prefix "$(BACKUP_PREFIX)"
+	@$(MAKE) --no-print-directory db-dump-pull
+
+db-dump-push: ## Upload the newest dump (or DUMP=) to the dataplatform bucket on S3
+	@$(call resolve_dump); \
+	echo "==> s3://$(BACKUP_BUCKET)/$(BACKUP_PREFIX)/$$(basename $$dump)" >&2; \
+	aws s3 cp "$$dump" "s3://$(BACKUP_BUCKET)/$(BACKUP_PREFIX)/$$(basename $$dump)"; \
+	echo "on the next machine:  make db-dump-pull db-restore-local" >&2
+
+db-dump-pull: ## Download the newest dump from S3 into backups/
+	@mkdir -p $(BACKUP_DIR); \
+	key=$$(aws s3api list-objects-v2 --bucket "$(BACKUP_BUCKET)" --prefix "$(BACKUP_PREFIX)/" \
+	  --query 'sort_by(Contents,&LastModified)[-1].Key' --output text 2>/dev/null); \
+	[ -n "$$key" ] && [ "$$key" != "None" ] || { \
+	  echo "nothing under s3://$(BACKUP_BUCKET)/$(BACKUP_PREFIX)/ — \`make db-dump-push\` from the machine that has one" >&2; exit 1; }; \
+	aws s3 cp "s3://$(BACKUP_BUCKET)/$$key" "$(BACKUP_DIR)/" && ls -lh "$(BACKUP_DIR)/$$(basename $$key)"
 
 # How far back `make app-logs` starts. Overridable: SINCE=1h.
 SINCE ?= 10m

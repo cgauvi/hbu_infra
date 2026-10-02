@@ -827,6 +827,126 @@ def cmd_stop(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Dumping from the bastion
+# ---------------------------------------------------------------------------
+
+
+def _bastion_id(project: str, env: str, region: str) -> str:
+    """The running bastion, by the tag Terraform gives it. Resolved fresh every
+    time for the same reason tunnel.sh does: the bastion is cattle, and a
+    stop/start or a replacement gives it a new instance id."""
+    ec2 = _aws("ec2", region)
+    reservations = ec2.describe_instances(
+        Filters=[
+            {"Name": "tag:Name", "Values": [f"{project}-{env}-bastion"]},
+            {"Name": "instance-state-name", "Values": ["running"]},
+        ]
+    )["Reservations"]
+    ids = [i["InstanceId"] for r in reservations for i in r["Instances"]]
+    if not ids:
+        raise DbError(
+            f"no running bastion named {project}-{env}-bastion — "
+            f"set enable_bastion = true in {env}.tfvars and `make plan apply ENV={env}`"
+        )
+    return ids[0]
+
+
+def cmd_dump_remote(args) -> int:
+    """pg_dump run *on the bastion*, shipped straight to S3.
+
+    The reason this exists is throughput: the SSM port-forward a laptop dump
+    rides tops out around 300 KB/s per session, and parallel connections share
+    the one websocket (measured 2026-10-01: 4 streams ~660 KB/s aggregate), so
+    a full dump through the tunnel takes half a day and dies at the scheduled
+    22:30 stop. The bastion sits next to the instance, dumps at VPC speed, and
+    uploads to S3 at EC2 speed; the laptop then downloads at its own.
+
+    The bastion's role already reads the SSM contract and the master secret
+    (that is what bastion_db_access grants). It has no S3 write, on purpose —
+    the upload goes through a presigned PUT URL minted here with the caller's
+    credentials, so nothing about the bastion's permissions changes. The URL
+    is visible in the SSM command history for anyone who can read it in this
+    account, and expires with --timeout.
+
+    The dump lands in /var/tmp on the bastion (/, ~6 GB free on the stock
+    8 GB volume — /tmp is a 207 MB tmpfs) and is removed afterwards; a failed
+    run removes its partial file via the EXIT trap.
+    """
+    import time
+
+    project = DEFAULT_PROJECT
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    key = f"{args.prefix.strip('/')}/{project}-{args.env}-{stamp}.dump"
+    bastion = _bastion_id(project, args.env, args.region)
+
+    put_url = _aws("s3", args.region).generate_presigned_url(
+        "put_object",
+        Params={"Bucket": args.bucket, "Key": key},
+        ExpiresIn=args.timeout + 600,
+    )
+
+    prefix = f"/{project}-{args.env}"
+    # Runs as root under AWS-RunShellScript on AL2023. postgresql16 pins the
+    # client major to the engine major in rds.tf; bump both together.
+    script = f"""
+set -eu
+command -v pg_dump >/dev/null 2>&1 || dnf install -y -q postgresql16 >/dev/null
+p() {{ aws ssm get-parameter --region {args.region} --with-decryption --name "{prefix}/db/$1" --query Parameter.Value --output text; }}
+HOST=$(p host); PORT=$(p port); DB=$(p name); USR=$(p user); ARN=$(p secret_arn)
+export PGPASSWORD=$(aws secretsmanager get-secret-value --region {args.region} --secret-id "$ARN" --query SecretString --output text | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')
+export PGSSLMODE=require
+OUT=/var/tmp/{project}-{args.env}-{stamp}.dump
+trap 'rm -f "$OUT.part"' EXIT
+avail=$(df -m --output=avail /var/tmp | tail -1 | tr -d ' ')
+[ "$avail" -ge 2000 ] || {{ echo "only ${{avail}}MB free on /var/tmp — not enough for a dump" >&2; exit 1; }}
+echo "dumping $DB from $HOST (${{avail}}MB free)"
+pg_dump -h "$HOST" -p "$PORT" -U "$USR" -d "$DB" --format=custom --compress=6 --no-password --file="$OUT.part"
+mv "$OUT.part" "$OUT"
+ls -lh "$OUT"
+curl -fsS --retry 3 -T "$OUT" '{put_url}'
+rm -f "$OUT"
+echo "uploaded: s3://{args.bucket}/{key}"
+"""
+
+    ssm = _aws("ssm", args.region)
+    command_id = ssm.send_command(
+        InstanceIds=[bastion],
+        DocumentName="AWS-RunShellScript",
+        Comment=f"pg_dump {project}-{args.env} to s3://{args.bucket}"[:100],
+        Parameters={"commands": [script], "executionTimeout": [str(args.timeout)]},
+    )["Command"]["CommandId"]
+
+    print(f"pg_dump running on {bastion} -> s3://{args.bucket}/{key}")
+    waited = 0
+    while True:
+        time.sleep(15)
+        waited += 15
+        try:
+            inv = ssm.get_command_invocation(CommandId=command_id, InstanceId=bastion)
+        except ssm.exceptions.InvocationDoesNotExist:
+            continue  # the invocation takes a few seconds to register
+        if inv["Status"] in ("Pending", "InProgress", "Delayed"):
+            if waited % 60 == 0:
+                print(f"{DIM}  …{inv['Status'].lower()}, {waited // 60} min{RESET}")
+            continue
+        break
+
+    out = (inv.get("StandardOutputContent") or "").strip()
+    err = (inv.get("StandardErrorContent") or "").strip()
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    if inv["Status"] != "Success":
+        raise DbError(
+            f"remote dump {inv['Status']} after {waited}s — the output above is the bastion's. "
+            "Nothing was uploaded unless it printed 'uploaded:'."
+        )
+    print(f"{GREEN}done{RESET} — fetch it with: make db-dump-pull")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -888,6 +1008,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("start", help="start a stopped instance").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="stop the instance").set_defaults(func=cmd_stop)
+
+    p = sub.add_parser(
+        "dump-remote",
+        help="pg_dump on the bastion, uploaded to S3 — no tunnel in the data path",
+    )
+    p.add_argument("--bucket", required=True, help="S3 bucket to upload into")
+    p.add_argument("--prefix", default="backups/db", help="key prefix (default: %(default)s)")
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=7200,
+        help="seconds the remote dump may take (default: %(default)s)",
+    )
+    p.set_defaults(func=cmd_dump_remote)
     return parser
 
 

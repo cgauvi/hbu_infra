@@ -1080,6 +1080,8 @@ ENV=dev COUNT=0` stops the Fargate and IPv4 charges without destroying
 anything; the ALB keeps billing until `enable_app = false` is applied, which
 also releases its DNS name — and with it any CNAME or alias record pointing at
 the old one, which has to be repointed after the next `enable_app = true`.
+`make destroy-app` is that apply with the confirmation built in — see "Tearing
+it down".
 
 `enable_scheduled_shutdown = true` adds EventBridge schedules that stop the
 instance overnight and start it in the morning, through the RDS API directly —
@@ -1098,9 +1100,106 @@ defaults to medium for that reason.
 
 ---
 
+## Moving the database off AWS
+
+Everything expensive in this stack exists to serve a database that fits on a
+laptop. hbu_rag_map already runs the same engine locally — `make db-up` over
+there builds and starts a postgis + pgvector container at the versions dev
+reports — so moving off RDS is a dump, a restore, and a copy on S3 for
+whatever machine comes next:
+
+```bash
+make db-dump-remote ENV=dev   # pg_dump on the bastion -> S3 -> backups/
+make db-restore-local         # ...into hbu_rag_map's local container
+```
+
+On any other machine (or this one, later): `make db-dump-pull
+db-restore-local`. Nothing in that pair touches RDS, so it keeps working after
+the instance is gone.
+
+### Two dump paths, one artifact
+
+`db-dump-remote` runs `pg_dump` **on the bastion** and ships the archive
+straight to S3 before pulling it down here. The data path matters: a dump
+through the SSM tunnel moves at roughly 300 KB/s per session, and parallel
+connections share the one websocket (measured 2026-10-01: four streams,
+~660 KB/s aggregate), so a laptop-side dump of this database takes half a day
+and dies at the 22:30 scheduled stop. Next to the instance it takes minutes.
+The bastion's role already reads the SSM contract and the master secret —
+that is what `bastion_db_access` grants — and it gets **no** S3 permission
+for this: the upload goes through a presigned PUT minted by your own
+credentials, so the bastion's footprint does not change.
+
+`db-dump` (with `TUNNEL=1`, through an open `db-tunnel`) is the same archive
+produced the slow way, kept for the day the bastion is already gone;
+`db-dump-push` sends it to the same S3 prefix. Either way a run killed
+halfway leaves a `.part` file, never something that looks finished.
+
+### The dump is the artifact, not the volume
+
+Both targets write one `pg_dump --format=custom` archive of the whole
+database — `rag`, `silver`, `gold` and `dagster`, schema and data. That one
+file is the migration *and* the backup *and* the transfer format, which is
+why there is no target that tars the container's pgdata volume to S3: the
+volume is larger (uncompressed pages and indexes versus a compressed logical
+dump), restorable only into a postgres built the same way, and holds nothing
+the dump does not. The dump restores into any postgres ≥ 16 that has the two
+extensions.
+
+On the laptop side, `pg_dump` and `pg_restore` run inside the local database
+image, not on the host, so their version always matches the server they talk
+to and nothing needs installing. The restore uses `--no-owner --no-acl`
+because the local container's `urban_rag` is superuser and the RDS-side roles
+(`hbu_admin`, `urban_rag_ro`) do not exist there.
+
+### Pointing the applications at it
+
+What `db-restore-local` prints at the end is the whole configuration:
+
+- **hbu_rag_map** — in its `.env`:
+  `DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:5432/urban_rag?sslmode=disable`.
+  The container speaks no TLS, hence `sslmode=disable`; there is no secret to
+  fetch, so no AWS credentials are needed to *connect*. The map's PMTiles
+  still come presigned off the dataplatform bucket (`HBU_TILES_URL`), so the
+  profile stays useful for that — S3 storage is pennies and survives every
+  teardown below.
+- **hbu_dataplatform** — the same URL in `URBAN_RAG_PG_DSN` (or spelled out in
+  `URBAN_RAG_PG_*`), and `DAGSTER_POSTGRES_URL` likewise if the run storage
+  should follow; the restored `dagster` schema carries the run history and
+  partition state with it.
+
+### What it costs to come back
+
+Nothing is one-way. A later `make plan apply` recreates whatever was torn
+down, `make db-init db-bootstrap` re-prime an empty instance, and the reverse
+of `db-restore-local` is a `pg_restore` of the same artifact pointed at the
+endpoint — the dump does not care which direction it travels.
+
+---
+
 ## Tearing it down
 
-Three targets, in this order, each one wider than the last:
+A part at a time first — the bill shrinks in this order, and each target
+prints what it is about to remove and waits for its own name typed back:
+
+```bash
+make app-scale ENV=dev COUNT=0   # stop Fargate billing; ALB keeps billing
+make destroy-app     ENV=dev     # ALB + ECS + the app's secrets (~$39/mo idle)
+make destroy-bastion ENV=dev     # the jump host (~$7/mo) — severs db-* access
+make destroy-db      ENV=dev     # the instance — take a last db-dump first
+```
+
+`destroy-app` and `destroy-bastion` apply the `enable_*` toggle off without
+editing the tfvars — which also means the next plain `make plan apply` puts
+the part back (and, for the app, collides with its secrets' 7-day deletion
+window). Edit `dev.tfvars` to make either permanent. `destroy-db` is a
+targeted destroy, since the instance has no toggle; its SSM contract, IAM
+policy and stop/start schedules go with it, and what stays behind (parameter
+group, log group, security group) costs pennies and is re-adopted on the next
+apply.
+
+Or everything at once. Three targets, in this order, each one wider than the
+last:
 
 ```bash
 make destroy      ENV=dev   # one environment
