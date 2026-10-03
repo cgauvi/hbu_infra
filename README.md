@@ -1152,21 +1152,173 @@ to and nothing needs installing. The restore uses `--no-owner --no-acl`
 because the local container's `urban_rag` is superuser and the RDS-side roles
 (`hbu_admin`, `urban_rag_ro`) do not exist there.
 
+### Recovering it on another machine
+
+The archive on S3 is the whole recovery. Any PostgreSQL ≥ 16 with the two
+extensions can take it, so the machine that receives it does not have to be
+this one, or Windows, or running Docker. What it *does* have to match is
+short, and worth stating exactly, because a mismatch only surfaces halfway
+through a twenty-minute restore:
+
+- **server** — PostgreSQL 16 or newer (this database is 16.4).
+- **extensions** — `postgis` 3.4.3, `vector` (pgvector) 0.8.1, `pg_trgm` 1.6,
+  `pg_stat_statements` 1.10. The first two are hard requirements: the geometry
+  columns and the 1024-dimension embeddings will not restore without them.
+- **encoding and collation** — UTF8, `en_US.utf8`. A database created under
+  `C` takes the data but orders text indexes differently, which changes what
+  the address search and the `pg_trgm` "did you mean" rungs return.
+- **a superuser role named `urban_rag`** — the archive creates its own
+  extensions, which needs superuser, and `urban_rag` is the name every
+  `DATABASE_URL` in the three repos expects.
+- **room** — roughly 3.2 GB for the archive and 16 GB restored; allow 40 GB.
+
+Note that the materialized views (`gold.lot_dossier`,
+`silver.street_directory`) are *recomputed* by the restore rather than copied
+— `pg_dump` emits a `REFRESH`, not the rows — so they come back populated but
+they are part of why the restore takes as long as it does.
+
+#### With the repos and Docker present
+
+The targets already in this Makefile do all of it, and none of them touches
+RDS, so this keeps working after the instance is gone:
+
+```bash
+cd hbu_rag_map
+make db-image-src                 # the pgvector source the local image builds from
+docker compose up -d postgres     # just the server — the restore replaces the database
+
+cd ../hbu_infra
+AWS_PROFILE=charles_gauvin_east_1 make db-dump-pull   # newest archive from S3
+make db-dump-verify                                   # read it end to end first
+make db-restore-local                                 # drop, recreate, pg_restore -j4, ANALYZE
+```
+
+`db-dump-pull` needs AWS credentials; nothing after it does.
+
+#### On a bare Ubuntu machine, without Docker
+
+Native postgres is the simpler answer on Ubuntu, because both extensions are
+packaged there — no image to build, and none of the Docker `/dev/shm` ceiling
+that bit this laptop. Ubuntu's own `postgresql-16` is fine; the PGDG
+repository below is what guarantees a matching `postgresql-16-pgvector`.
+
+```bash
+# 1. PostgreSQL 16 and the extensions
+sudo apt-get update
+sudo apt-get install -y curl ca-certificates gnupg lsb-release
+sudo install -d /usr/share/postgresql-common/pgdg
+sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+  -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+  | sudo tee /etc/apt/sources.list.d/pgdg.list
+sudo apt-get update
+sudo apt-get install -y postgresql-16 postgresql-16-postgis-3 postgresql-16-pgvector
+
+# 2. The locale the archive was taken under
+sudo sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+sudo locale-gen
+
+# 3. The role and the database
+sudo -u postgres psql -c "CREATE ROLE urban_rag LOGIN SUPERUSER PASSWORD 'urban_rag';"
+sudo -u postgres createdb -O urban_rag -T template0 -E UTF8 \
+  --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8 urban_rag
+
+# 4. The archive — newest under the backups prefix
+sudo apt-get install -y awscli          # or the v2 installer; any configured profile
+KEY=$(aws s3api list-objects-v2 --bucket urban-rag-dataplatform \
+        --prefix backups/db/ --query 'sort_by(Contents,&LastModified)[-1].Key' \
+        --output text)
+aws s3 cp "s3://urban-rag-dataplatform/$KEY" ~/        # ~3.2 GB
+DUMP=~/$(basename "$KEY")
+
+# 5. Prove it is intact BEFORE trusting it. --list only reads the table of
+#    contents at the tail of the file and passes on an archive whose middle is
+#    a hole; --file=/dev/null reads every block and throws the SQL away.
+pg_restore --file=/dev/null "$DUMP" && echo "archive intact"
+
+# 6. Restore
+PGPASSWORD=urban_rag pg_restore -h 127.0.0.1 -U urban_rag -d urban_rag \
+  --no-owner --no-acl --jobs=4 "$DUMP"
+sudo -u postgres psql -d urban_rag -c "ANALYZE;"
+```
+
+`--no-owner --no-acl` because the RDS-side roles (`hbu_admin`,
+`urban_rag_ro`) do not exist on a fresh machine and nothing local needs them.
+`pg_restore` will print warnings about them anyway; the counts in step 7 are
+the verdict, not its exit code.
+
+A restore of this size is bound by index builds and WAL, not by the archive.
+On a machine with memory to spare, before step 6:
+
+```bash
+sudo -u postgres psql -c "ALTER SYSTEM SET maintenance_work_mem='2GB'"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_wal_size='8GB'"
+sudo -u postgres psql -c "ALTER SYSTEM SET checkpoint_timeout='30min'"
+sudo systemctl restart postgresql@16-main
+```
+
+and `ALTER SYSTEM RESET` all three afterwards — they are restore settings, not
+serving settings, and `max_wal_size` especially will cost disk if left.
+
+#### What a good restore looks like
+
+```bash
+psql postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag -c "
+  select 'rag.lots' t, count(*) from rag.lots
+  union all select 'rag.chunks', count(*) from rag.chunks
+  union all select 'silver.lot_addresses', count(*) from silver.lot_addresses
+  union all select 'gold.lot_dossier', count(*) from gold.lot_dossier
+  union all select 'dagster.runs', count(*) from dagster.runs"
+```
+
+As of the 2026-10-03 archive: 172 099 lots, 11 359 chunks, 346 409 lot
+addresses, 168 631 dossier rows, 709 Dagster runs. The `dagster` schema is in
+there on purpose — the run history and the partition state come back with the
+data, so the pipeline on the new machine knows what has already been
+materialised.
+
+Then point the applications at it exactly as below: `DB_TARGET=local` is
+already the default in all three repos, and the DSN it resolves to is
+`postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable`.
+
 ### Pointing the applications at it
 
-What `db-restore-local` prints at the end is the whole configuration:
+Nothing, as of the `DB_TARGET` switch: all three repos already point here.
 
-- **hbu_rag_map** — in its `.env`:
-  `DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:5432/urban_rag?sslmode=disable`.
-  The container speaks no TLS, hence `sslmode=disable`; there is no secret to
-  fetch, so no AWS credentials are needed to *connect*. The map's PMTiles
-  still come presigned off the dataplatform bucket (`HBU_TILES_URL`), so the
-  profile stays useful for that — S3 storage is pennies and survives every
-  teardown below.
-- **hbu_dataplatform** — the same URL in `URBAN_RAG_PG_DSN` (or spelled out in
-  `URBAN_RAG_PG_*`), and `DAGSTER_POSTGRES_URL` likewise if the run storage
-  should follow; the restored `dagster` schema carries the run history and
-  partition state with it.
+```bash
+make db-check                              # here, against the container
+cd ../hbu_dataplatform && make hbu         # the pipeline, against the container
+cd ../hbu_rag_map      && make run         # the map, against the container
+```
+
+`DB_TARGET` is one variable, under the same name and with the same two values
+in all three Makefiles. `local` — the default — is this container on
+`127.0.0.1:5432`; `rds` is the instance, which in this repo still means the
+endpoint from SSM and the password from Secrets Manager, with `TUNNEL=1` when
+the port-forward is what carries it. Each branch sets the whole connection and
+blanks the other's, so a `DATABASE_URL` left in a shell cannot quietly
+redirect a `db-init`, and a stale `URBAN_RAG_PG_HOST` in a `.env` cannot
+quietly redirect a materialisation.
+
+What the switch does for each repo:
+
+- **hbu_rag_map** — `DATABASE_URL` to this container, which is what
+  [src/utils/db.py](../hbu_rag_map/src/utils/db.py) reads first. The container
+  speaks no TLS, hence `sslmode=disable`; there is no secret to fetch, so no
+  AWS credentials are needed to *connect*. The map's PMTiles still come
+  presigned off the dataplatform bucket (`HBU_TILES_URL`), so the profile
+  stays useful for that — S3 storage is pennies and survives every teardown
+  below.
+- **hbu_dataplatform** — the same URL as `URBAN_RAG_PG_DSN`, which short-circuits
+  `core.pg` ahead of any secret lookup, CA bundle or AWS call. `dagster_home.py`
+  reads it too, so the run storage follows into the same database's `dagster`
+  schema — the one the restored dump carries, with the run history and the
+  partition state in it.
+- **hbu_infra** — `DATABASE_URL`, which `scripts/db.py` has always read ahead
+  of SSM. So `db-init`, `db-check`, `db-shell`, `db-query` and `db-url` all
+  work against the container; the targets that act on the *instance* —
+  `db-start`, `db-stop`, `db-tunnel`, `db-dump`, `db-dump-remote`,
+  `db-bootstrap` — refuse to run unless `DB_TARGET=rds`.
 
 ### What it costs to come back
 

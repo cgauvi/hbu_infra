@@ -17,6 +17,11 @@
 #   make app-url      ENV=dev       # where it ended up
 #   make app-dns      ENV=dev       # the record to point a domain at it
 #
+#   # which database the db-* targets below talk to - the same switch,
+#   # under the same name, in all three urban repos:
+#   make db-check                   # the local container (the default)
+#   make db-check DB_TARGET=rds TUNNEL=1   # hbu-dev, through an open db-tunnel
+#
 #   # day to day:
 #   make db-shell    ENV=dev        # interactive SQL
 #   make db-check    ENV=dev        # what is installed and loaded
@@ -31,6 +36,8 @@
 #   make db-dump-remote ENV=dev     # pg_dump on the bastion -> S3 -> backups/
 #   make db-restore-local           # ...into hbu_rag_map's local container
 #   make db-dump-pull               # (any other machine: newest dump from S3)
+#   make db-dump-local              # ...from the container, once it is the truth
+#   make db-dump-verify             # read an archive end to end before trusting it
 #
 #   # the tunnel-only variants, for when the bastion is already gone — slow:
 #   make db-tunnel ENV=dev          # one shell, left running
@@ -211,6 +218,64 @@ ENVS ?= $(filter-out %.auto,$(patsubst %.tfvars,%,$(wildcard *.tfvars)))
 LOCAL_PORT ?= 5433
 TUNNEL     ?=
 
+# -- which database --------------------------------------------------------
+#
+# One switch, carried by all three urban repos under the same name and with
+# the same two values:
+#
+#   DB_TARGET=local  (default) the postgis+pgvector container hbu_rag_map
+#                    runs - `cd ../hbu_rag_map && make db-up` - published on
+#                    127.0.0.1:$(LOCAL_PG_PORT). It is what `db-restore-local`
+#                    below restores into.
+#   DB_TARGET=rds    the $(PROJECT)-$(ENV) instance, exactly as every db-*
+#                    target here has always resolved it: endpoint from SSM,
+#                    password from Secrets Manager, address swapped for the
+#                    port-forward with TUNNEL=1.
+#
+# scripts/db.py already reads DATABASE_URL ahead of SSM - that is the override
+# the local branch sets, and the rds branch clears so a DATABASE_URL left in a
+# shell cannot quietly redirect a db-init or a db-check at the instance.
+#
+# Note what this does NOT switch: terraform, the app-* targets, and the
+# handful of db-* targets that act on the instance itself rather than on a
+# database - they stop it, port-forward to it, dump it from the bastion. Those
+# take require_rds below and refuse to run in local mode.
+DB_TARGET ?= local
+
+# Not LOCAL_PORT above, which is where the SSM port-forward listens. This is
+# the container's published port; HBU_LOCAL_PG_PORT is the name hbu_rag_map's
+# compose file reads, so a shell that moved the container moves this with it.
+LOCAL_PG_PORT ?= $(or $(HBU_LOCAL_PG_PORT),5432)
+# 127.0.0.1 rather than localhost, for the reason given at db-tunnel: a machine
+# that answers localhost with ::1 first makes libpq spend its whole
+# connect_timeout on a dead address before falling back.
+LOCAL_PG_URL  ?= postgresql://urban_rag:urban_rag@127.0.0.1:$(LOCAL_PG_PORT)/urban_rag?sslmode=disable
+
+ifeq (local,$(DB_TARGET))
+DB_TARGET_DESC = the local container, 127.0.0.1:$(LOCAL_PG_PORT)
+DB_ENV         = DATABASE_URL="$(LOCAL_PG_URL)"
+# TUNNEL is about reaching the instance, so it means nothing here - and
+# honouring it would be worse than ignoring it: db.py swaps the host *after*
+# resolving DATABASE_URL, which would point the local branch at the tunnel.
+DB_TUNNEL_ARG  =
+else ifeq (rds,$(DB_TARGET))
+DB_TARGET_DESC = $(PROJECT)-$(ENV)$(if $(TUNNEL), through 127.0.0.1:$(LOCAL_PORT), direct)
+DB_ENV         = DATABASE_URL=
+DB_TUNNEL_ARG  = $(if $(TUNNEL),--tunnel $(LOCAL_PORT))
+else
+$(error DB_TARGET must be `local` or `rds`, not `$(DB_TARGET)`)
+endif
+
+# Prepended to the recipes that act on the instance rather than on a database.
+# Without it the failure is indirect: db.py resolves DATABASE_URL, finds no
+# instance id behind it, and reports that rather than the switch that caused it.
+define require_rds
+[ "$(DB_TARGET)" = "rds" ] || { \
+  echo "$@ acts on the $(PROJECT)-$(ENV) instance, but DB_TARGET=$(DB_TARGET)" >&2; \
+  echo "  points at $(DB_TARGET_DESC). Re-run with DB_TARGET=rds." >&2; \
+  exit 1; }
+endef
+
 # A native Windows uv launched from msys2's sh can inherit no TMP at all, fall
 # back to C:\WINDOWS and die with "Access is denied"; cygpath gives it a real
 # one. No-op on Linux and on any shell that already sets TMP.
@@ -252,19 +317,22 @@ endif
 # choose their CLI path instead of running an empty command.
 PY = $$(V="$${VIRTUAL_ENV:-$(VENV)}"; for p in $(PY_NAMES); do [ -e "$$V/$$p" ] && { echo "$$V/$$p"; exit; }; done; echo "$$V/$(firstword $(PY_NAMES))")
 
-DB = $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(if $(TUNNEL),--tunnel $(LOCAL_PORT))
+DB = $(DB_ENV) $(PY) scripts/db.py --env $(ENV) --region $(AWS_REGION) $(DB_TUNNEL_ARG)
 
 .PHONY: help aws-check bootstrap init-shared plan-shared apply-shared destroy-shared \
         init plan apply destroy fmt validate output \
         destroy-all destroy-bootstrap destroy-app destroy-bastion destroy-db \
-        db-deps uv-check db-init db-check db-shell db-url db-secret db-env \
+        db-deps uv-check db-target db-init db-check db-shell db-url db-secret db-env \
         db-query db-wait db-start db-stop db-tunnel \
-        db-dump db-dump-remote db-restore-local db-dump-push db-dump-pull \
+        db-dump db-dump-remote db-dump-local db-dump-verify db-restore-local \
+        db-dump-push db-dump-pull \
         app-login app-build app-push app-deploy app-status app-wait app-logs \
         app-url app-dns app-shell app-scale app-password app-hf-token app-mapbox-token
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo "  ENV=$(ENV)  DB_TARGET=$(DB_TARGET) -> $(DB_TARGET_DESC)"
 
 # Order-only so a failure stops the run before anything touches AWS, and so the
 # check runs once per invocation no matter how many of these are named.
@@ -607,6 +675,17 @@ uv-check:
 	  echo "uv installed but not on this PATH — open a new shell and re-run"; exit 1; \
 	}
 
+db-target: ## Print which database the db-* targets resolve to
+	@echo "DB_TARGET=$(DB_TARGET) -> $(DB_TARGET_DESC)"
+
+# gold.lot_dossier is the one materialized object here, so it is the one that
+# can be correct and stale at the same time. db-init rebuilds it; after a gold
+# chain run - which rewrites the six tables underneath it - this is what makes
+# it agree with them again. CONCURRENTLY so the map keeps reading throughout,
+# which the unique index in sql/032 is there to allow.
+db-refresh-dossier: ## Rebuild gold.lot_dossier from the gold tables under it
+	$(DB) query "SET statement_timeout = 0; REFRESH MATERIALIZED VIEW CONCURRENTLY gold.lot_dossier; ANALYZE gold.lot_dossier"
+
 db-init: ## Apply sql/*.sql — roles, extensions, the rag working set, the silver/gold tables
 	$(DB) init
 
@@ -614,6 +693,7 @@ db-init: ## Apply sql/*.sql — roles, extensions, the rag working set, the silv
 # this target does is the credential no .sql file carries: generate the role's
 # password, set it, and write it to the secret Terraform created for it.
 db-bootstrap: ## Create the urban_rag role + grants, storing its password in Secrets Manager
+	@$(call require_rds)
 	$(DB) bootstrap --store-password
 
 db-ca: ## Download the RDS root certificate that sslmode=verify-full needs
@@ -644,9 +724,11 @@ db-wait: ## Block until the instance accepts connections
 	$(DB) wait
 
 db-start: ## Start a stopped instance
+	@$(call require_rds)
 	$(DB) start
 
 db-stop: ## Stop the instance
+	@$(call require_rds)
 	$(DB) stop
 
 # Only for a database with no public endpoint. Leaves psql-able postgres on
@@ -660,6 +742,7 @@ db-stop: ## Stop the instance
 # itself" in the README for the tunables (TUNNEL_SUPERVISE=0 for a plain
 # one-shot session) and for why a public endpoint is not the simpler answer.
 db-tunnel: ## Supervised port-forward through the SSM bastion to 127.0.0.1:$(LOCAL_PORT)
+	@$(call require_rds)
 	./scripts/tunnel.sh $(ENV) $(LOCAL_PORT) $(AWS_REGION)
 
 # ---------------------------------------------------------------------------
@@ -723,6 +806,7 @@ endef
 # first so a dump killed halfway — the tunnel dropping, the 22:30 scheduled
 # stop — never leaves something that looks like a finished artifact.
 db-dump: ## pg_dump of ENV into backups/ (through an open db-tunnel: TUNNEL=1)
+	@$(call require_rds)
 	@mkdir -p $(BACKUP_DIR)
 	@eval "$$($(DB) env)"; \
 	host="$$PGHOST"; [ "$$host" = "127.0.0.1" ] && host=host.docker.internal; \
@@ -746,6 +830,52 @@ db-dump: ## pg_dump of ENV into backups/ (through an open db-tunnel: TUNNEL=1)
 	    --file="//backups/$$out.part" \
 	&& mv "$(BACKUP_DIR)/$$out.part" "$(BACKUP_DIR)/$$out" \
 	&& ls -lh "$(BACKUP_DIR)/$$out"
+
+# The same archive taken from the local container instead of the RDS - the
+# other direction of db-restore-local, and what db-dump-push should be sending
+# once the container is the source of truth. `db-dump` cannot do this: it is
+# deliberately RDS-only because it resolves its credentials through SSM and the
+# master secret, neither of which exists for the container.
+#
+# Same shape as db-restore-local - a throwaway client container mounting
+# $(BACKUP_DIR) and dialling the published port - so the pg_dump version always
+# matches the server it reads. Written to .part first for the same reason
+# db-dump is: a dump killed halfway must never look like a finished artifact.
+db-dump-local: ## pg_dump the local container into backups/ (when local is the source of truth)
+	@mkdir -p $(BACKUP_DIR)
+	@docker exec $(LOCAL_DB_CONTAINER) pg_isready -U urban_rag -d urban_rag >/dev/null 2>&1 || { \
+	  echo "the local container is not running. In $(APP_DIR):  make db-up" >&2; exit 1; }
+	@ts=$$(date +%Y%m%d-%H%M%S); out="hbu-local-$$ts.dump"; \
+	bdir=$$(cd $(BACKUP_DIR) && { pwd -W 2>/dev/null || pwd; }); \
+	echo "==> pg_dump $(LOCAL_DB_CONTAINER) -> $(BACKUP_DIR)/$$out" >&2; \
+	$(DOCKER_NOCONV) docker run --rm --add-host=host.docker.internal:host-gateway \
+	  -v "$$bdir:/backups" -e PGPASSWORD=urban_rag $(PG_CLIENT_IMAGE) \
+	  pg_dump -h host.docker.internal -p "$(LOCAL_PG_PORT)" -U urban_rag -d urban_rag \
+	    --format=custom --compress=6 --no-password \
+	    --file="//backups/$$out.part" \
+	&& mv "$(BACKUP_DIR)/$$out.part" "$(BACKUP_DIR)/$$out" \
+	&& ls -lh "$(BACKUP_DIR)/$$out"
+
+# Proves an archive is intact before it is the only copy left. pg_restore reads
+# every block and the SQL is thrown away, so this needs no database and changes
+# nothing. `pg_restore --list` is NOT this check: the table of contents lives at
+# the tail of the file, so a listing succeeds on an archive whose middle is a
+# hole - exactly the damage a half-finished upload or a bad disk leaves behind.
+#
+# //dev/null, not /dev/null: MSYS rewrites a lone /dev/null to the Windows `nul`,
+# which inside the container is an ordinary RELATIVE filename - so the check
+# silently writes the entire decompressed dump into the container's layer
+# instead of discarding it. Linux reads the doubled slash as one.
+db-dump-verify: ## Read an archive end to end to prove it is intact (DUMP= to pick one)
+	@$(call resolve_dump); \
+	bdir=$$(cd "$$(dirname "$$dump")" && { pwd -W 2>/dev/null || pwd; }); \
+	f=$$(basename "$$dump"); \
+	echo "==> reading every block of $$dump" >&2; \
+	$(DOCKER_NOCONV) docker run --rm -v "$$bdir:/backups" $(PG_CLIENT_IMAGE) \
+	  pg_restore --file=//dev/null "//backups/$$f" || exit 1; \
+	n=$$($(DOCKER_NOCONV) docker run --rm -v "$$bdir:/backups" $(PG_CLIENT_IMAGE) \
+	  pg_restore --list "//backups/$$f" | grep -c '^[0-9]'); \
+	echo "OK - $$f is readable end to end, $$n objects in the archive" >&2
 
 # Into hbu_rag_map's local container, REPLACING whatever urban_rag database it
 # holds. The container is left to that repo to run (`make db-up` there);
@@ -771,7 +901,7 @@ db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
 	f=$$(basename "$$dump"); \
 	$(DOCKER_NOCONV) docker run --rm --add-host=host.docker.internal:host-gateway \
 	  -v "$$bdir:/backups" -e PGPASSWORD=urban_rag $(PG_CLIENT_IMAGE) \
-	  pg_restore -h host.docker.internal -p "$${HBU_LOCAL_PG_PORT:-5432}" \
+	  pg_restore -h host.docker.internal -p "$(LOCAL_PG_PORT)" \
 	    -U urban_rag -d urban_rag --no-owner --no-acl \
 	    --jobs=$(RESTORE_JOBS) "//backups/$$f" \
 	  || echo "pg_restore reported errors above — check the counts below before trusting or redoing" >&2; \
@@ -779,8 +909,11 @@ db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
 	docker exec $(LOCAL_DB_CONTAINER) psql -q -U urban_rag -d urban_rag -c "ANALYZE;"; \
 	docker exec $(LOCAL_DB_CONTAINER) psql -U urban_rag -d urban_rag -c \
 	  "select schemaname, count(*) as tables, pg_size_pretty(sum(pg_total_relation_size(schemaname||'.'||quote_ident(tablename)))::bigint) as size from pg_tables where schemaname in ('rag','silver','gold','dagster') group by 1 order by 1;"; \
-	echo "point the apps at it:" >&2; \
-	echo "  DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:$${HBU_LOCAL_PG_PORT:-5432}/urban_rag?sslmode=disable" >&2
+	echo "point the apps at it - DB_TARGET=local is the default in all three:" >&2; \
+	echo "  make db-check                        (here)" >&2; \
+	echo "  cd ../hbu_dataplatform && make status BACKEND=postgres" >&2; \
+	echo "  cd ../hbu_rag_map && make run" >&2; \
+	echo "  DATABASE_URL=$(LOCAL_PG_URL)         (for anything that reads .env)" >&2
 
 # The fast path, and the one to prefer for a full copy: the tunnel the target
 # above rides tops out around 300 KB/s per SSM session (parallel connections
@@ -789,6 +922,7 @@ db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
 # the bastion instead — VPC speed next to the instance, EC2 speed up to S3 —
 # and needs no tunnel at all; it ends by pulling the artifact down here.
 db-dump-remote: ## pg_dump on the bastion straight to S3, then pulled here — the fast path
+	@$(call require_rds)
 	PYTHONUNBUFFERED=1 $(DB) dump-remote --bucket "$(BACKUP_BUCKET)" --prefix "$(BACKUP_PREFIX)"
 	@$(MAKE) --no-print-directory db-dump-pull
 
