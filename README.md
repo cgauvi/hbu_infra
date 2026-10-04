@@ -1482,6 +1482,7 @@ numbers are what say what has to exist before what:
 | [`032_silver_council_planning_items.sql`](sql/032_silver_council_planning_items.sql) | `silver.council_planning_items` — Quebec City's conseils de quartier minutes and their trail, read into planning items | 003_warehouse |
 | [`035_silver_council_item_sites.sql`](sql/035_silver_council_item_sites.sql) | `silver.council_item_sites`, the `citations` and `outcome` columns on 032's table, the `silver.street_key` / `street_core` / `place_key` folds, `rag.council_items_near` | 032, 002, 028, 003_warehouse |
 | [`036_council_search.sql`](sql/036_council_search.sql) | `rag.search_council_chunks` — the council corpus searched by meaning, narrowed through the items | 035 **and** `rag.chunks` — *skipped until it exists* |
+| [`037_silver_cucq_decisions.sql`](sql/037_silver_cucq_decisions.sql) | `silver.cucq_decisions` — the Commission d'urbanisme et de conservation de Québec's minutes read into one row per permit request, placed on a borough by address | 003_warehouse; placement reads 028's `silver.lot_addresses` and 035's `street_core` |
 
 The numbers are the dependency order and nothing else reads them: `db.py init`
 sorts the directory and applies it, so a new table is a new file at the end
