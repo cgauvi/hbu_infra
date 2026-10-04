@@ -764,6 +764,9 @@ db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
 	@$(call resolve_dump); \
 	docker exec $(LOCAL_DB_CONTAINER) pg_isready -U urban_rag -d postgres >/dev/null 2>&1 || { \
 	  echo "the local container is not running. In $(APP_DIR):  make db-up" >&2; exit 1; }; \
+	docker port $(LOCAL_DB_CONTAINER) 5432 >/dev/null 2>&1 || { \
+	  echo "$(LOCAL_DB_CONTAINER) is running but publishes no port, so pg_restore could not reach it." >&2; \
+	  echo "  In $(APP_DIR):  make db-up   (recreates it; the data volume is kept)" >&2; exit 1; }; \
 	echo "==> replacing database urban_rag in $(LOCAL_DB_CONTAINER) with $$dump" >&2; \
 	docker exec $(LOCAL_DB_CONTAINER) dropdb -U urban_rag --force --if-exists urban_rag || exit 1; \
 	docker exec $(LOCAL_DB_CONTAINER) createdb -U urban_rag urban_rag || exit 1; \
@@ -780,7 +783,8 @@ db-restore-local: ## Restore the newest dump (or DUMP=) into the local container
 	docker exec $(LOCAL_DB_CONTAINER) psql -U urban_rag -d urban_rag -c \
 	  "select schemaname, count(*) as tables, pg_size_pretty(sum(pg_total_relation_size(schemaname||'.'||quote_ident(tablename)))::bigint) as size from pg_tables where schemaname in ('rag','silver','gold','dagster') group by 1 order by 1;"; \
 	echo "point the apps at it:" >&2; \
-	echo "  DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:$${HBU_LOCAL_PG_PORT:-5432}/urban_rag?sslmode=disable" >&2
+	echo "  hbu_rag_map:      make run   (DB_TARGET=local is the default)" >&2; \
+	echo "  anything else:    DATABASE_URL=postgresql://urban_rag:urban_rag@127.0.0.1:$${HBU_LOCAL_PG_PORT:-5432}/urban_rag?sslmode=disable" >&2
 
 # The fast path, and the one to prefer for a full copy: the tunnel the target
 # above rides tops out around 300 KB/s per SSM session (parallel connections

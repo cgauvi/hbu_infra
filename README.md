@@ -1156,8 +1156,12 @@ because the local container's `urban_rag` is superuser and the RDS-side roles
 
 What `db-restore-local` prints at the end is the whole configuration:
 
-- **hbu_rag_map** — in its `.env`:
-  `DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:5432/urban_rag?sslmode=disable`.
+- **hbu_rag_map** — nothing to edit: `make run` (and `make docker-run`)
+  default to `DB_TARGET=local`, which sets
+  `DATABASE_URL=postgresql://urban_rag:urban_rag@127.0.0.1:5432/urban_rag?sslmode=disable`
+  itself and overrides `.env`. `make run DB_TARGET=rds`, with
+  `make db-tunnel ENV=dev LOCAL_PORT=5433` open here, points it back at RDS.
+  Only a process started by hand reads the URL from `.env`.
   The container speaks no TLS, hence `sslmode=disable`; there is no secret to
   fetch, so no AWS credentials are needed to *connect*. The map's PMTiles
   still come presigned off the dataplatform bucket (`HBU_TILES_URL`), so the
@@ -1327,6 +1331,9 @@ numbers are what say what has to exist before what:
 | [`024_gold_lot_surface_parking.sql`](sql/024_gold_lot_surface_parking.sql) | `gold.lot_surface_parking` | 001, for `geometry`; 003_warehouse |
 | [`025_silver_lot_zone_pieces.sql`](sql/025_silver_lot_zone_pieces.sql) | `silver.lot_zone_pieces` | 001, for `geometry`; 003_warehouse |
 | [`026_silver_lot_addresses.sql`](sql/026_silver_lot_addresses.sql) | `rag.addresses` **and** `silver.lot_addresses` | 001, for `geometry`; 003_warehouse |
+| [`030_silver_council_planning_items.sql`](sql/030_silver_council_planning_items.sql) | `silver.council_planning_items` — Quebec City's conseils de quartier minutes and their trail, read into planning items | 003_warehouse |
+| [`032_silver_council_item_sites.sql`](sql/032_silver_council_item_sites.sql) | `silver.council_item_sites`, the `citations` and `outcome` columns on 030's table, the `silver.street_key` / `street_core` / `place_key` folds, `rag.council_items_near` | 030, 002, 026, 003_warehouse |
+| [`033_council_search.sql`](sql/033_council_search.sql) | `rag.search_council_chunks` — the council corpus searched by meaning, narrowed through the items | 032 **and** `rag.chunks` — *skipped until it exists* |
 
 The numbers are the dependency order and nothing else reads them: `db.py init`
 sorts the directory and applies it, so a new table is a new file at the end
