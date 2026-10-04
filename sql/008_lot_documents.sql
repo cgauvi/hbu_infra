@@ -1,6 +1,6 @@
 -- requires: rag.chunks
 --
--- Lot -> PDF. The last hop of the chain 005_silver_lot_features.sql opens up.
+-- Lot -> PDF. The last hop of the chain 007_silver_lot_features.sql opens up.
 --
 -- `silver.lot_features` says which map features cover a lot;
 -- `rag.chunks.feature_ids` says which features cite each document. Putting the
@@ -11,10 +11,10 @@
 -- The `-- requires:` header above is read by scripts/db.py, which skips this
 -- file with a note when rag.chunks does not exist yet - that table belongs to
 -- the dataplatform and is created on its first load. Same handling as
--- 003_spatial_search.sql; see its header for why skipping beats failing.
+-- 004_spatial_search.sql; see its header for why skipping beats failing.
 --
 -- Ordering note: this file sorts after 005, which is what lets it name
--- silver.lot_features in a view body. 003_spatial_search.sql cannot, which is
+-- silver.lot_features in a view body. 004_spatial_search.sql cannot, which is
 -- why rag.search_at_lot there still does the lot x feature intersection inline.
 -- That function answers from a point and stays the entry point for "what
 -- applies here"; this view answers from a lot already identified, off a join
@@ -52,7 +52,7 @@ SET search_path TO rag, public;
 -- each other by centimetres along every lot line - a survey disagreement
 -- wearing a zone's number, not a small amount of governing. The column is on
 -- the view rather than the cutoff being applied here, for the reason
--- 005_silver_lot_features.sql gives for not thresholding at all: the cutoff
+-- 007_silver_lot_features.sql gives for not thresholding at all: the cutoff
 -- belongs to the question being asked. hbu_dataplatform's
 -- `postgis.MIN_ZONE_OVERLAP_M2` and hbu_rag_map's `queries.MIN_ZONE_OVERLAP_M2`
 -- are the same square metre applied at the two ends that ask it.
@@ -73,7 +73,7 @@ DROP VIEW IF EXISTS rag.lot_documents;
 -- the borough next door published. The feature's namespace is on rag.features
 -- (through `feature_uid`); a chunk carries only the borough its corpus was
 -- indexed under, and that borough's namespace is read off the features it
--- filed — the bridge 003_spatial_search.sql's rag.chunk_features uses.
+-- filed — the bridge 004_spatial_search.sql's rag.chunk_features uses.
 -- Collapsing the documents to the namespace also keeps one row per (lot,
 -- document) where a namespace spans several boroughs' corpora.
 CREATE VIEW rag.lot_documents AS

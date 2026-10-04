@@ -352,7 +352,7 @@ COMMENT ON MATERIALIZED VIEW gold.lot_dossier IS
     'scrape_date); add is_primary_zone for one row per lot. Columns prefixed '
     'parcel_ are whole-parcel facts repeated across its pieces - never SUM '
     'them. Materialized: stale until refreshed after a gold chain run. See '
-    'hbu_infra/sql/032_gold_lot_dossier.sql.';
+    'hbu_infra/sql/034_gold_lot_dossier.sql.';
 
 
 -- Same handover as every other file here: created by whoever runs db-init,

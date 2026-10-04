@@ -2,7 +2,7 @@
 -- map's address box can match a half-typed, misspelt or unaccented street
 -- against in one indexed read.
 --
--- requires: 001_extensions.sql (pg_trgm), 026_silver_lot_addresses.sql
+-- requires: 001_extensions.sql (pg_trgm), 028_silver_lot_addresses.sql
 --
 -- ---------------------------------------------------------------------------
 -- Why a materialized view

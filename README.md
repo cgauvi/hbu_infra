@@ -421,8 +421,8 @@ make db-check     ENV=dev TUNNEL=1
 `db-init` will report two files skipped:
 
 ```
-003_spatial_search.sql skipped — rag.chunks does not exist yet
-006_lot_documents.sql  skipped — rag.chunks does not exist yet
+004_spatial_search.sql skipped — rag.chunks does not exist yet
+008_lot_documents.sql  skipped — rag.chunks does not exist yet
 ```
 
 That is expected, not a fault: both build views and SQL-language functions over
@@ -1454,42 +1454,47 @@ numbers are what say what has to exist before what:
 | [`000_roles.sql`](sql/000_roles.sql) | `urban_rag`, `urban_rag_ro`, the five schemas, the grants | the master user |
 | [`001_extensions.sql`](sql/001_extensions.sql) | `postgis`, `vector`, `pg_trgm`, `pg_stat_statements`, and a notice if PostGIS is too old for the dataplatform to render the map's vector tiles | `rds_superuser` |
 | [`002_spatial.sql`](sql/002_spatial.sql) | `rag.features`, `rag.lots`, `rag.buildings` | 001, for `geometry` |
-| [`003_spatial_search.sql`](sql/003_spatial_search.sql) | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot`, `rag.corpus_status` | `rag.chunks` — *skipped until it exists* |
 | [`003_warehouse.sql`](sql/003_warehouse.sql) | `warehouse.ensure_partition`, `warehouse.partitions` | 000 |
-| [`004_silver_building_lots.sql`](sql/004_silver_building_lots.sql) | `silver.building_lot_intersections` | 003_warehouse, and `rag.buildings` — *header* |
-| [`005_silver_lot_features.sql`](sql/005_silver_lot_features.sql) | `silver.lot_features`, and widens `rag.features`'s uniqueness to the borough | 002, 003_warehouse |
-| [`006_lot_documents.sql`](sql/006_lot_documents.sql) | `rag.lot_documents`, `rag.search_at_lot_number` | 005 **and** `rag.chunks` — *skipped until it exists* |
-| [`007_silver_streets.sql`](sql/007_silver_streets.sql) | `silver.neighborhood_streets` | 003_warehouse |
-| [`008_silver_lot_frontage.sql`](sql/008_silver_lot_frontage.sql) | `silver.lot_frontage` | 002, and `silver.neighborhood_streets` from 007 — *header* |
-| [`009_gold_lot_profiles.sql`](sql/009_gold_lot_profiles.sql) | `gold.lot_profiles` | 002, 003_warehouse |
-| [`010_silver_cmhc.sql`](sql/010_silver_cmhc.sql) | the four CMHC tables | 003_warehouse |
-| [`011_silver_corpus.sql`](sql/011_silver_corpus.sql) | `silver.document_chunks` | 003_warehouse |
-| [`012_silver_zoning.sql`](sql/012_silver_zoning.sql) | `silver.zoning_grid_columns`, `silver.lot_zoning_envelopes` | 003_warehouse |
-| [`013_silver_lot_assessed_values.sql`](sql/013_silver_lot_assessed_values.sql) | `silver.lot_assessed_values` | 001, for `geometry`; 003_warehouse |
-| [`014_silver_assessment_units.sql`](sql/014_silver_assessment_units.sql) | `silver.assessment_units` | 001, for `geometry`; 003_warehouse |
-| [`015_silver_lot_buildable_setbacks.sql`](sql/015_silver_lot_buildable_setbacks.sql) | `silver.lot_buildable_setbacks` | 001, for `geometry`; 003_warehouse |
-| [`016_silver_lot_assessment_comparables.sql`](sql/016_silver_lot_assessment_comparables.sql) | `silver.lot_assessment_comparables` | 001, for `geometry`; 003_warehouse |
-| [`017_silver_lot_development_programs.sql`](sql/017_silver_lot_development_programs.sql) | `silver.lot_development_programs` | 003_warehouse |
-| [`018_gold_lot_highest_best_use.sql`](sql/018_gold_lot_highest_best_use.sql) | `gold.lot_highest_best_use` | 003_warehouse |
-| [`019_gold_lot_redevelopment_gap.sql`](sql/019_gold_lot_redevelopment_gap.sql) | `gold.lot_redevelopment_gap` | 003_warehouse |
-| [`020_silver_commercial_rents.sql`](sql/020_silver_commercial_rents.sql) | `silver.commercial_rents` | 003_warehouse |
-| [`021_gold_lot_investment_opportunities.sql`](sql/021_gold_lot_investment_opportunities.sql) | `gold.lot_investment_opportunities` | 003_warehouse |
-| [`022_gold_lot_building_massing.sql`](sql/022_gold_lot_building_massing.sql) | `gold.lot_building_massing` | 001, for `geometry`; 003_warehouse |
-| [`023_gold_map_cell_aggregates.sql`](sql/023_gold_map_cell_aggregates.sql) | `gold.map_cell_aggregates` | 001, for `geometry`; 003_warehouse |
-| [`024_gold_lot_surface_parking.sql`](sql/024_gold_lot_surface_parking.sql) | `gold.lot_surface_parking` | 001, for `geometry`; 003_warehouse |
-| [`025_silver_lot_zone_pieces.sql`](sql/025_silver_lot_zone_pieces.sql) | `silver.lot_zone_pieces` | 001, for `geometry`; 003_warehouse |
-| [`026_silver_lot_addresses.sql`](sql/026_silver_lot_addresses.sql) | `rag.addresses` **and** `silver.lot_addresses` | 001, for `geometry`; 003_warehouse |
-| [`030_silver_council_planning_items.sql`](sql/030_silver_council_planning_items.sql) | `silver.council_planning_items` — Quebec City's conseils de quartier minutes and their trail, read into planning items | 003_warehouse |
-| [`032_silver_council_item_sites.sql`](sql/032_silver_council_item_sites.sql) | `silver.council_item_sites`, the `citations` and `outcome` columns on 030's table, the `silver.street_key` / `street_core` / `place_key` folds, `rag.council_items_near` | 030, 002, 026, 003_warehouse |
-| [`033_council_search.sql`](sql/033_council_search.sql) | `rag.search_council_chunks` — the council corpus searched by meaning, narrowed through the items | 032 **and** `rag.chunks` — *skipped until it exists* |
+| [`004_spatial_search.sql`](sql/004_spatial_search.sql) | `rag.chunk_features`, `rag.search_near`, `rag.search_at_lot`, `rag.corpus_status` | `rag.chunks` — *skipped until it exists* |
+| [`006_silver_building_lots.sql`](sql/006_silver_building_lots.sql) | `silver.building_lot_intersections` | 003_warehouse, and `rag.buildings` — *header* |
+| [`007_silver_lot_features.sql`](sql/007_silver_lot_features.sql) | `silver.lot_features`, and widens `rag.features`'s uniqueness to the borough | 002, 003_warehouse |
+| [`008_lot_documents.sql`](sql/008_lot_documents.sql) | `rag.lot_documents`, `rag.search_at_lot_number` | 007 **and** `rag.chunks` — *skipped until it exists* |
+| [`009_silver_streets.sql`](sql/009_silver_streets.sql) | `silver.neighborhood_streets` | 003_warehouse |
+| [`010_silver_lot_frontage.sql`](sql/010_silver_lot_frontage.sql) | `silver.lot_frontage` | 002, and `silver.neighborhood_streets` from 009 — *header* |
+| [`011_gold_lot_profiles.sql`](sql/011_gold_lot_profiles.sql) | `gold.lot_profiles` | 002, 003_warehouse |
+| [`012_silver_cmhc.sql`](sql/012_silver_cmhc.sql) | the four CMHC tables | 003_warehouse |
+| [`013_silver_corpus.sql`](sql/013_silver_corpus.sql) | `silver.document_chunks` | 003_warehouse |
+| [`014_silver_zoning.sql`](sql/014_silver_zoning.sql) | `silver.zoning_grid_columns`, `silver.lot_zoning_envelopes` | 003_warehouse |
+| [`015_silver_lot_assessed_values.sql`](sql/015_silver_lot_assessed_values.sql) | `silver.lot_assessed_values` | 001, for `geometry`; 003_warehouse |
+| [`016_silver_assessment_units.sql`](sql/016_silver_assessment_units.sql) | `silver.assessment_units` | 001, for `geometry`; 003_warehouse |
+| [`017_silver_lot_buildable_setbacks.sql`](sql/017_silver_lot_buildable_setbacks.sql) | `silver.lot_buildable_setbacks` | 001, for `geometry`; 003_warehouse |
+| [`018_silver_lot_assessment_comparables.sql`](sql/018_silver_lot_assessment_comparables.sql) | `silver.lot_assessment_comparables` | 001, for `geometry`; 003_warehouse |
+| [`019_silver_lot_development_programs.sql`](sql/019_silver_lot_development_programs.sql) | `silver.lot_development_programs` | 003_warehouse |
+| [`020_gold_lot_highest_best_use.sql`](sql/020_gold_lot_highest_best_use.sql) | `gold.lot_highest_best_use` | 003_warehouse |
+| [`021_gold_lot_redevelopment_gap.sql`](sql/021_gold_lot_redevelopment_gap.sql) | `gold.lot_redevelopment_gap` | 003_warehouse |
+| [`022_silver_commercial_rents.sql`](sql/022_silver_commercial_rents.sql) | `silver.commercial_rents` | 003_warehouse |
+| [`023_gold_lot_investment_opportunities.sql`](sql/023_gold_lot_investment_opportunities.sql) | `gold.lot_investment_opportunities` | 003_warehouse |
+| [`024_gold_lot_building_massing.sql`](sql/024_gold_lot_building_massing.sql) | `gold.lot_building_massing` | 001, for `geometry`; 003_warehouse |
+| [`025_gold_map_cell_aggregates.sql`](sql/025_gold_map_cell_aggregates.sql) | `gold.map_cell_aggregates` | 001, for `geometry`; 003_warehouse |
+| [`026_gold_lot_surface_parking.sql`](sql/026_gold_lot_surface_parking.sql) | `gold.lot_surface_parking` | 001, for `geometry`; 003_warehouse |
+| [`027_silver_lot_zone_pieces.sql`](sql/027_silver_lot_zone_pieces.sql) | `silver.lot_zone_pieces` | 001, for `geometry`; 003_warehouse |
+| [`028_silver_lot_addresses.sql`](sql/028_silver_lot_addresses.sql) | `rag.addresses` **and** `silver.lot_addresses` | 001, for `geometry`; 003_warehouse |
+| [`032_silver_council_planning_items.sql`](sql/032_silver_council_planning_items.sql) | `silver.council_planning_items` — Quebec City's conseils de quartier minutes and their trail, read into planning items | 003_warehouse |
+| [`035_silver_council_item_sites.sql`](sql/035_silver_council_item_sites.sql) | `silver.council_item_sites`, the `citations` and `outcome` columns on 032's table, the `silver.street_key` / `street_core` / `place_key` folds, `rag.council_items_near` | 032, 002, 028, 003_warehouse |
+| [`036_council_search.sql`](sql/036_council_search.sql) | `rag.search_council_chunks` — the council corpus searched by meaning, narrowed through the items | 035 **and** `rag.chunks` — *skipped until it exists* |
 
 The numbers are the dependency order and nothing else reads them: `db.py init`
 sorts the directory and applies it, so a new table is a new file at the end
 rather than an edit to an existing one.
 
-`003_warehouse.sql` sorting *after* `003_spatial_search.sql` is name order doing
-its job rather than a collision: `s` < `w`, and everything from `004` on needs
-the partition function that file creates.
+Every file carries a distinct number and the sequence has no gaps, so the
+sorted order `db.py init` applies is exactly the order written here. A new file
+takes the next free number at the end; two branches that both append must
+renumber one of them rather than leave a tie, because a tie is broken by the
+rest of the name and so stops meaning anything.
+
+`003_warehouse.sql` sits as early as it does because the partition function it
+creates is what every `silver`/`gold` file from `006` on calls.
 
 Every file is idempotent, and `db-init` is meant to be re-run: `CREATE ... IF
 NOT EXISTS` throughout, ownership handed over at the end of each file guarded on
@@ -1506,17 +1511,17 @@ A file may also declare a relation it cannot be *parsed* without:
 if it is missing, rather than failing. Four files carry that header today, for
 two different reasons.
 
-`003_spatial_search.sql` and `006_lot_documents.sql` both name `rag.chunks`,
+`004_spatial_search.sql` and `008_lot_documents.sql` both name `rag.chunks`,
 which belongs to the dataplatform: a SQL-language function body is parsed at
 `CREATE` time, so neither can be created before that table exists — and a hard
 error on the first run of a new database would be noise rather than
 information. Re-run `db-init` after the first `document_index` materialization
 and they land.
 
-`004_silver_building_lots.sql` names `rag.buildings` and
-`008_silver_lot_frontage.sql` names `silver.neighborhood_streets`, and both of
-those are created by an earlier file in this same directory — `002` and `007`.
+`006_silver_building_lots.sql` names `rag.buildings` and
+`010_silver_lot_frontage.sql` names `silver.neighborhood_streets`, and both of
+those are created by an earlier file in this same directory — `002` and `009`.
 The header states a dependency the numbers already encode, so that a file
 skipped upstream produces a named skip here rather than a failure further in:
-`004` carries a real foreign key on `rag.buildings` and would raise without it,
-and `008` would create a `lot_frontage` with nothing to join to.
+`006` carries a real foreign key on `rag.buildings` and would raise without it,
+and `010` would create a `lot_frontage` with nothing to join to.

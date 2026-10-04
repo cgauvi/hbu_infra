@@ -135,7 +135,7 @@ CREATE INDEX IF NOT EXISTS addresses_partition_idx
 -- The published table
 -- ---------------------------------------------------------------------------
 
--- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- The block 006_silver_building_lots.sql explains: a table still partitioned
 -- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
 -- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
 DO $migrate$
@@ -201,7 +201,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.lot_addresses (
     -- The partition key leads, in the order 003_warehouse.sql explains; the
-    -- cell columns are the point's own (rag.addresses, 028_cell_key.sql). The
+    -- cell columns are the point's own (rag.addresses, 030_cell_key.sql). The
     -- borough is the lot's, carried for the map's per-borough reads.
     scrape_date    date NOT NULL,
     cell_key       text COLLATE "C" NOT NULL,

@@ -74,7 +74,7 @@
 
 SET search_path TO silver, public;
 
--- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- The block 006_silver_building_lots.sql explains: a table still partitioned
 -- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
 -- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
 DO $migrate$
@@ -140,7 +140,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.lot_development_programs (
     -- The partition key leads, in the order 003_warehouse.sql explains; the
-    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- cell columns are the lot's (030_cell_key.sql) and the borough is the
     -- lot's too — whose CMHC rents the solve was priced at, and what the map
     -- reads by.
     scrape_date    date NOT NULL,

@@ -172,7 +172,7 @@ CREATE INDEX IF NOT EXISTS zoning_grid_columns_solvable_idx
 -- is carried beside it for the readers that need one that survives a reload.
 -- ---------------------------------------------------------------------------
 
--- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- The block 006_silver_building_lots.sql explains: a table still partitioned
 -- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
 -- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
 -- silver.zoning_grid_columns above is not touched: it stays on the borough.
@@ -239,7 +239,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.lot_zoning_envelopes (
     -- The partition key leads, in the order 003_warehouse.sql explains; the
-    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- cell columns are the lot's (030_cell_key.sql) and the borough is the
     -- lot's too — the one whose grid this row was read from.
     scrape_date    date NOT NULL,
     cell_key       text COLLATE "C" NOT NULL,

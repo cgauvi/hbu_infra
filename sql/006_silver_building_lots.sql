@@ -30,7 +30,7 @@
 -- drop the second kind, and they are an *or*: a slice is kept if it is large
 -- enough to be a building, or is enough of its own footprint to be one. See
 -- those constants for why that is not the *and* the zone cutoffs in
--- 005_silver_lot_features.sql use, and why the difference matters.
+-- 007_silver_lot_features.sql use, and why the difference matters.
 --
 -- So this table is thresholded rather than faithful, and that is the one place
 -- the two silver joins deliberately differ. A zone sliver is a real overlap
@@ -163,7 +163,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.building_lot_intersections (
     -- The partition key leads, in the order 003_warehouse.sql explains. The
-    -- cell columns are the lot's own (028_cell_key.sql): a row belongs to the
+    -- cell columns are the lot's own (030_cell_key.sql): a row belongs to the
     -- cut cell that owns its lot. The borough stays as an attribute — the map
     -- reads by it — and is the lot's, so a cell astride a borough line holds
     -- rows of both.

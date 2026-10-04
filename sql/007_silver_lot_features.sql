@@ -21,7 +21,7 @@
 -- reason the building join keeps the corner of a triplex crossing a lot line:
 -- the cutoff belongs to the question being asked, not to the geometry.
 -- `pct_of_lot` is the column to filter on, and `rag.lot_documents`
--- (006_lot_documents.sql) ranks by it rather than picking for the caller.
+-- (008_lot_documents.sql) ranks by it rather than picking for the caller.
 --
 -- Computed by hbu_dataplatform (`urban_rag.postgis.compute_lot_features`) one
 -- cut cell at a time — the cell's `rag.lots` against every `rag.features` row
@@ -54,7 +54,7 @@ SET search_path TO silver, public;
 -- This file first widened the key by `neighborhood`, which worked because a
 -- borough was 1:1 with the namespace that actually tells the rows apart. Since
 -- the lot chain moved to the tile axis the key is on that namespace itself —
--- `source_namespace`, 027_features_source_namespace.sql — because a borough is
+-- `source_namespace`, 029_features_source_namespace.sql — because a borough is
 -- now an attribute a feature carries rather than the unit anything reads it
 -- by, and a lot's zones are found across borough lines. The swap 027 declined
 -- "until the partition key moves" is made here: `features_identity_key` is
@@ -194,7 +194,7 @@ $$;
 -- stated in the columns a reader can actually name.
 -- ---------------------------------------------------------------------------
 
--- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- The block 006_silver_building_lots.sql explains: a table still partitioned
 -- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
 -- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
 DO $migrate$
@@ -259,7 +259,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.lot_features (
     -- The partition key leads, in the order 003_warehouse.sql explains; the
-    -- cell columns are the lot's (028_cell_key.sql) and the borough is the
+    -- cell columns are the lot's (030_cell_key.sql) and the borough is the
     -- lot's too, carried for the map's per-borough reads. A feature filed by
     -- another borough is still this lot's row: that is what the global pool
     -- buys, and rag.features says whose the feature is.

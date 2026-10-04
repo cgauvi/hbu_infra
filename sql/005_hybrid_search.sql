@@ -13,7 +13,7 @@
 --
 -- WHY THIS IS A SEPARATE FILE
 --
--- `003_spatial_search.sql` is parsed as a whole, and a SQL-language function
+-- `004_spatial_search.sql` is parsed as a whole, and a SQL-language function
 -- body is parsed at CREATE time. A database whose `rag.chunks` predates the
 -- `tsv` column would fail to create *every* function in that file, including
 -- the two that work perfectly well without it. Here the `-- requires:` header

@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS rag.features (
     -- one zoning layer each and no namespace at all. `source_table` is the
     -- file slug and drops it, which is why C01-001 in one borough and
     -- C01-001 in the next need something else to tell them apart. See
-    -- 027_features_source_namespace.sql and the dataplatform's
+    -- 029_features_source_namespace.sql and the dataplatform's
     -- `urban_rag.partitions.source_namespace_for`.
     source_namespace text NOT NULL DEFAULT '',
     neighborhood text NOT NULL,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS rag.features (
     -- Unique per publisher's namespace, not per borough: the file slug in
     -- `source_table` drops the namespace, and zone numbers restart in every
     -- borough. `neighborhood` above is the borough that loaded the row and is
-    -- not part of it. On an existing database 005_silver_lot_features.sql
+    -- not part of it. On an existing database 007_silver_lot_features.sql
     -- makes the same swap, since this CREATE is a no-op there.
     CONSTRAINT features_identity_key
         UNIQUE (source_table, feature_id, source_namespace, scrape_date)

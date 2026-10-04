@@ -1,6 +1,6 @@
 -- rag.features.source_namespace — the publisher's own unit, named at last.
 --
--- 005_silver_lot_features.sql widened this table's uniqueness from
+-- 007_silver_lot_features.sql widened this table's uniqueness from
 -- (source_table, feature_id, scrape_date) to
 -- (source_table, feature_id, neighborhood, scrape_date), because `source_table`
 -- is the file slug — `Reglement_urbanisme__VSP_REG_ZONE` — and the slug drops
@@ -34,7 +34,7 @@
 -- It does not touch `features_identity_key`. When this file was written the
 -- constraint stayed on `neighborhood`, because the two were 1:1 and the swap
 -- belonged with the repartition. The repartition has happened (2026-09-24):
--- 005_silver_lot_features.sql, which runs before this file, now moves the key
+-- 007_silver_lot_features.sql, which runs before this file, now moves the key
 -- onto (source_table, feature_id, source_namespace, scrape_date) — on Quebec
 -- City that collapses six arrondissements into one namespace, which is the
 -- point, since its zone codes are unique city-wide. On a database where this

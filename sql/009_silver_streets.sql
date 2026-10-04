@@ -9,7 +9,7 @@
 --
 -- It draws one centre line per segment where the géobase double drew two
 -- sides, one along each curb. That matters less than it sounds: the frontage
--- measure in 008_silver_lot_frontage.sql is the boundary a lot *shares* with a
+-- measure in 010_silver_lot_frontage.sql is the boundary a lot *shares* with a
 -- road parcel and needs no line at all. What the line does is identify which
 -- parcels are roadway and name the street, and a centre line does both — it
 -- runs down the axis of the road parcel rather than hugging its edge. Where it
@@ -61,7 +61,7 @@
 
 SET search_path TO silver, public;
 
--- The block 004_silver_building_lots.sql explains: a table still partitioned
+-- The block 006_silver_building_lots.sql explains: a table still partitioned
 -- on `neighborhood` is renamed `_by_neighborhood`, its indexes and constraints
 -- suffixed `_bn`, so the CREATE below makes the cell-partitioned one beside it.
 DO $migrate$
@@ -127,7 +127,7 @@ $migrate$;
 
 CREATE TABLE IF NOT EXISTS silver.neighborhood_streets (
     -- The partition key leads, in the order 003_warehouse.sql explains. The
-    -- cell columns are the side's own, taken at its midpoint (028_cell_key.sql
+    -- cell columns are the side's own, taken at its midpoint (030_cell_key.sql
     -- for the address): a side belongs to the cell its midpoint is in. The
     -- borough is the outline containing that midpoint, and nullable — see the
     -- header — which is the one place in the lot chain it is.

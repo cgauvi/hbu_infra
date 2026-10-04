@@ -37,7 +37,7 @@ SET search_path TO rag, public;
 --
 -- A chunk carries the borough its corpus was indexed under and no namespace;
 -- a feature carries its namespace, which is what identifies it since
--- 005_silver_lot_features.sql moved `features_identity_key` onto it. The
+-- 007_silver_lot_features.sql moved `features_identity_key` onto it. The
 -- bridge is rag.features itself — the namespace a borough's own features were
 -- filed under — so the match holds where one namespace spans several
 -- boroughs (Quebec City's arrondissements share one layer, and a zone is kept
