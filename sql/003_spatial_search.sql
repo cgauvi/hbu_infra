@@ -46,6 +46,13 @@ SET search_path TO rag, public;
 
 CREATE OR REPLACE VIEW rag.chunk_features AS
     SELECT c.chunk_id,
+           -- The borough travels with the chunk id, because the two together
+           -- are the key. Without it `search_near` joins back to rag.chunks on
+           -- chunk_id alone and fans out across BOTH boroughs for the 33
+           -- sheets Quebec City's arrondissements share - the same
+           -- composite-key bug the primary key was widened to stop, left
+           -- behind in this view.
+           c.neighborhood,
            c.doc_id,
            f.feature_uid,
            f.geom
@@ -72,9 +79,11 @@ CREATE OR REPLACE VIEW rag.chunk_features AS
 -- near this point" and only those get ranked by similarity.
 --
 -- One consequence worth knowing: because the spatial filter runs first and is
--- selective, the planner will usually scan the surviving chunks rather than
--- use the HNSW index — which is the right plan, and means recall here is
--- exact rather than approximate.
+-- selective, the surviving candidate set is small - so it is materialised and
+-- sorted exactly, rather than left to the HNSW index. See the note on
+-- `candidates` below: letting the index answer the ORDER BY returns the
+-- corpus's nearest chunks and then filters them all away, which is an empty
+-- result rather than a wrong one, and so is easy to mistake for silence.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION rag.search_near (
@@ -94,6 +103,8 @@ RETURNS TABLE (
     neighborhood text,
     scrape_date  date,
     chunk_text   text,
+    page_from    integer,
+    page_to      integer,
     distance_m   double precision,
     similarity   double precision
 )
@@ -104,26 +115,51 @@ AS $$
     ),
     nearby AS (
         SELECT cf.chunk_id,
+               cf.neighborhood,
                min(ST_Distance(cf.geom::geography, origin.g)) AS distance_m
           FROM rag.chunk_features cf
          CROSS JOIN origin
          WHERE ST_DWithin(cf.geom::geography, origin.g, radius_m)
-         GROUP BY cf.chunk_id
+         GROUP BY cf.chunk_id, cf.neighborhood
+    ),
+    -- MATERIALIZED for the reason spelled out on `search_at_lot` above: left
+    -- free to, the planner answers the ORDER BY from the HNSW index, which
+    -- ranks the whole corpus and then has its candidates thrown away by this
+    -- radius - returning nothing, silently. The surviving set is small, so an
+    -- exact sort over it is both cheaper and right.
+    candidates AS MATERIALIZED (
+        SELECT c.chunk_id,
+               c.doc_id,
+               c.url,
+               c.title,
+               c.source_table,
+               c.neighborhood,
+               c.scrape_date,
+               c.text,
+               c.page_from,
+               c.page_to,
+               c.embedding,
+               n.distance_m
+          FROM nearby n
+          JOIN rag.chunks c
+            ON c.chunk_id = n.chunk_id
+           AND c.neighborhood = n.neighborhood
+         WHERE on_scrape_date IS NULL OR c.scrape_date = on_scrape_date
     )
-    SELECT c.chunk_id,
-           c.doc_id,
-           c.url,
-           c.title,
-           c.source_table,
-           c.neighborhood,
-           c.scrape_date,
-           c.text,
-           n.distance_m,
-           1 - (c.embedding <=> query_embedding) AS similarity
-      FROM nearby n
-      JOIN rag.chunks c USING (chunk_id)
-     WHERE on_scrape_date IS NULL OR c.scrape_date = on_scrape_date
-     ORDER BY c.embedding <=> query_embedding
+    SELECT chunk_id,
+           doc_id,
+           url,
+           title,
+           source_table,
+           neighborhood,
+           scrape_date,
+           text,
+           page_from,
+           page_to,
+           distance_m,
+           1 - (embedding <=> query_embedding) AS similarity
+      FROM candidates
+     ORDER BY embedding <=> query_embedding
      LIMIT match_count;
 $$;
 
@@ -147,6 +183,8 @@ RETURNS TABLE (
     url          text,
     source_table text,
     chunk_text   text,
+    page_from    integer,
+    page_to      integer,
     similarity   double precision
 )
 LANGUAGE sql STABLE
@@ -162,30 +200,66 @@ AS $$
          WHERE ST_Intersects(l.geom, p.g)
          ORDER BY l.scrape_date DESC
          LIMIT 1
+    ),
+    -- MATERIALIZED is load-bearing, and the reason is a silent wrong answer.
+    --
+    -- Without it the planner is free to answer `ORDER BY embedding <=> q
+    -- LIMIT n` from the HNSW index, and an HNSW scan returns the n nearest
+    -- chunks in the WHOLE corpus and only then applies the join. A lot is
+    -- covered by one or two zones out of thousands, so the globally-nearest
+    -- chunks are almost never among them, and the join throws all of them
+    -- away: the function returns NOTHING, which reads as "the by-law is
+    -- silent about this" rather than as a bug.
+    --
+    -- Measured on the restored dev snapshot, lot 2 214 825, which genuinely
+    -- has 2 chunks:
+    --     match_count=2,  ef_search default -> 0 rows
+    --     match_count=5,  ef_search default -> 2 rows
+    --     match_count=2,  ef_search 100     -> 2 rows
+    --     match_count=2,  ef_search 400     -> 0 rows
+    -- Non-monotonic in both knobs, because what is really changing is the
+    -- planner's choice between the index and a scan. Tuning ef_search cannot
+    -- fix it; removing the choice can.
+    --
+    -- The candidate set here is a handful of rows, so sorting it exactly costs
+    -- nothing and recall becomes exact rather than approximate - which is what
+    -- the comment on this file used to claim the planner did on its own.
+    candidates AS MATERIALIZED (
+        SELECT lot.lot_number,
+               c.chunk_id,
+               c.url,
+               c.source_table,
+               c.text,
+               c.page_from,
+               c.page_to,
+               c.embedding
+          FROM lot
+          JOIN rag.features f ON ST_Intersects(f.geom, lot.geom)
+          JOIN rag.chunks c
+            ON c.source_table = f.source_table
+           AND c.scrape_date = f.scrape_date
+           AND c.feature_ids ? f.feature_id
+           -- The feature's namespace, reached from the chunk's borough the way
+           -- rag.chunk_features above explains.
+           AND EXISTS (
+               SELECT 1
+                 FROM rag.features ns
+                WHERE ns.source_table = c.source_table
+                  AND ns.source_namespace = f.source_namespace
+                  AND ns.scrape_date = c.scrape_date
+                  AND ns.neighborhood = c.neighborhood
+           )
     )
-    SELECT lot.lot_number,
-           c.chunk_id,
-           c.url,
-           c.source_table,
-           c.text,
-           1 - (c.embedding <=> query_embedding) AS similarity
-      FROM lot
-      JOIN rag.features f ON ST_Intersects(f.geom, lot.geom)
-      JOIN rag.chunks c
-        ON c.source_table = f.source_table
-       AND c.scrape_date = f.scrape_date
-       AND c.feature_ids ? f.feature_id
-       -- The feature's namespace, reached from the chunk's borough the way
-       -- rag.chunk_features above explains.
-       AND EXISTS (
-           SELECT 1
-             FROM rag.features ns
-            WHERE ns.source_table = c.source_table
-              AND ns.source_namespace = f.source_namespace
-              AND ns.scrape_date = c.scrape_date
-              AND ns.neighborhood = c.neighborhood
-       )
-     ORDER BY c.embedding <=> query_embedding
+    SELECT lot_number,
+           chunk_id,
+           url,
+           source_table,
+           text,
+           page_from,
+           page_to,
+           1 - (embedding <=> query_embedding) AS similarity
+      FROM candidates
+     ORDER BY embedding <=> query_embedding
      LIMIT match_count;
 $$;
 

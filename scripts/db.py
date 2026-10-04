@@ -437,6 +437,30 @@ def _requires(sql: str) -> str | None:
     return None
 
 
+def _relation_exists(conn, required: str) -> bool:
+    """Whether a `-- requires:` target is there yet.
+
+    Two spellings. `schema.table` is a relation and `to_regclass` answers it.
+    `schema.table.column` is a *column*, which `to_regclass` cannot see at all
+    - it would return the relation and the file would be applied against a
+    table missing the column it needs. A SQL-language function body is parsed
+    at CREATE time, so that is a hard failure on `db init` rather than a
+    deferred one, which is exactly what this check exists to avoid.
+    """
+    parts = required.split(".")
+    if len(parts) == 3:
+        schema, table, column = parts
+        _, rows = _run(
+            conn,
+            "SELECT 1 FROM information_schema.columns "
+            " WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (schema, table, column),
+        )
+        return bool(rows)
+    _, rows = _run(conn, "SELECT to_regclass(%s)", (required,))
+    return bool(rows) and rows[0][0] is not None
+
+
 def cmd_init(args) -> int:
     details = resolve(args.env, region=args.region)
     files = sorted(SQL_DIR.glob("*.sql"))
@@ -459,8 +483,7 @@ def cmd_init(args) -> int:
             # its first load. Skipping it is information, not an error.
             required = _requires(sql)
             if required:
-                _, rows = _run(conn, "SELECT to_regclass(%s)", (required,))
-                if not rows or rows[0][0] is None:
+                if not _relation_exists(conn, required):
                     print(f"{BOLD}{path.name}{RESET} {DIM}skipped — {required} does not exist yet{RESET}")
                     skipped += 1
                     continue
@@ -610,6 +633,7 @@ def cmd_check(args) -> int:
                             WHEN 'r' THEN 'table'
                             WHEN 'p' THEN 'partitioned'
                             WHEN 'v' THEN 'view'
+                            WHEN 'm' THEN 'matview'
                             ELSE c.relkind::text END AS kind,
                        COALESCE(s.n_live_tup, 0) AS rows,
                        pg_size_pretty(pg_total_relation_size(c.oid)) AS size
@@ -617,7 +641,7 @@ def cmd_check(args) -> int:
                   JOIN pg_namespace n ON n.oid = c.relnamespace
                   LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
                  WHERE n.nspname = %s
-                   AND c.relkind IN ('r', 'p', 'v')
+                   AND c.relkind IN ('r', 'p', 'v', 'm')
                    -- Leaves are listed by `partitions` below, at the grain
                    -- they are actually managed at.
                    AND NOT EXISTS (
