@@ -192,3 +192,53 @@ $$;
 -- here would be this platform inventing a text the ministry never wrote.
 ALTER TABLE silver.assessment_units
     ADD COLUMN IF NOT EXISTS use_description text;
+
+-- ---------------------------------------------------------------------------
+-- Widening: the lots a unit covers, and the fiscal regime it is filed under
+-- ---------------------------------------------------------------------------
+--
+-- Three columns added 2026-10-05, as ALTERs for the reason the one above is.
+-- All three are folded onto the unit from the roll's one-to-many layers by
+-- `assessment_units` (`lots_per_unit`, `fiscal_regimes`), and all three exist
+-- for one question the open roll cannot otherwise approach: who owns it. The
+-- roll withholds its whole owner section (RL02 — name, status, mailing
+-- address) from the open publication, and the licence forbids re-identifying
+-- it. What survives is structural:
+--
+-- `lot_numbers` — every cadastre lot `b05v_lot_cadst` says the unit covers,
+-- as a jsonb array of lot keys spelled the roll's way ("5342219", no spaces;
+-- see hbu_dataplatform's `lot_key`). An *unité d'évaluation* is by definition
+-- one owner's (LFM art. 34), so two addresses whose lots sit in one unit's
+-- list are one owner's — a definitive answer. Two addresses in two units are
+-- a question the roll cannot settle: two separately saleable houses are two
+-- units under one owner as readily as under two. Null where the roll places
+-- the unit by address alone (a condominium's private lot Infolot does not
+-- draw), in which case the point in `geom` is what puts it on a lot.
+--
+-- `fiscal_regimes` — the articles of law the unit's fiscal breakdown cites,
+-- distinct and sorted: "F-2.1 art. 204" is the Loi sur la fiscalité
+-- municipale's exemption for the State, the municipalities, the school
+-- service centres and the churches; "F-2.1 art. 255" the compensation a
+-- hospital or a university pays in lieu; "M-14 art. 36.0.1" the farm credit.
+-- Not an owner, but the kind of body the owner is — the one thing the open
+-- roll says on the subject. Null on a unit taxed whole, which is 98% of them.
+--
+-- `fiscal_regime_value` — the value under those regimes, in dollars, read off
+-- the whole-unit rows of the breakdown (I = T + B on every unit checked, so
+-- the parts are not added to it).
+--
+-- A row written before 2026-10-05 reads NULL on all three: that is "written
+-- before the column existed", not "no lots" or "taxed whole". `make roll` for
+-- the partition backfills them.
+ALTER TABLE silver.assessment_units
+    ADD COLUMN IF NOT EXISTS lot_numbers jsonb;
+ALTER TABLE silver.assessment_units
+    ADD COLUMN IF NOT EXISTS fiscal_regimes text;
+ALTER TABLE silver.assessment_units
+    ADD COLUMN IF NOT EXISTS fiscal_regime_value numeric;
+
+-- `lot_numbers ? '5342219'` — the unit(s) the roll files a lot under, which is
+-- how the map answers "is this address in the same unit as that one" without
+-- a point-in-polygon. jsonb_path_ops cannot serve `?`; the default opclass can.
+CREATE INDEX IF NOT EXISTS assessment_units_lot_numbers_idx
+    ON silver.assessment_units USING gin (lot_numbers);
